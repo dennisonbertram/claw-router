@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Self-contained test suite for cr. No real Claude, no network.
+# Run: bash test/run.sh
+set -uo pipefail
+
+CR_REPO="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PASS=0; FAIL=0
+ok()   { printf '  ok   %s\n' "$1"; PASS=$((PASS+1)); }
+bad()  { printf '  FAIL %s\n' "$1"; printf '       %s\n' "${2:-}"; FAIL=$((FAIL+1)); }
+eq()   { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "expected [$3] got [$2]"; fi; }
+
+# Isolated sandbox per run.
+SBX="$(mktemp -d)"
+trap 'rm -rf "$SBX"' EXIT
+export CR_HOME="$SBX/crhome"
+
+# Fake claude on PATH: records env+args, exits with $FAKE_EXIT (default 0).
+FAKEBIN="$SBX/bin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+{
+  echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "API_KEY=${ANTHROPIC_API_KEY-<unset>}"
+  echo "AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+  echo "ARGS=$*"
+} > "$FAKE_OUT"
+exit "${FAKE_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/claude"
+export PATH="$FAKEBIN:$PATH"
+export FAKE_OUT="$SBX/claude_out"
+
+CR="$CR_REPO/cr"
+run_cr() { "$CR" "$@" 2>"$SBX/stderr"; }
+
+# Seed a registry with three accounts (default has null configDir).
+seed() {
+  rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{ "selection": "round-robin",
+  "accounts": [
+    {"name":"default","configDir":null,"email":"a@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+    {"name":"work","configDir":"$CR_HOME/accounts/work","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+    {"name":"home","configDir":"$CR_HOME/accounts/home","email":"c@x","plan":"pro","lastUsed":0,"enabled":true,"usagePct":null}
+  ],
+  "rotation": {"cursor":0},
+  "share": {} }
+JSON
+}
+
+echo "== selection (unit) =="
+# Source the lib directly to test pure functions.
+( export CR_HOME="$SBX/lib_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"a","configDir":null,"lastUsed":30,"enabled":true},
+  {"name":"b","configDir":"/b","lastUsed":10,"enabled":true},
+  {"name":"c","configDir":"/c","lastUsed":20,"enabled":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # round-robin skips disabled c: a,b,a,b
+  r1="$(cr_select_round_robin)"; r2="$(cr_select_round_robin)"
+  r3="$(cr_select_round_robin)"; r4="$(cr_select_round_robin)"
+  eq "round-robin cycles a,b,a,b over enabled" "$r1$r2$r3$r4" "abab"
+  # lru picks smallest lastUsed among enabled (b=10; c disabled)
+  eq "lru picks least-recently-used enabled" "$(cr_select_lru)" "b"
+  # keychain hash recipe matches shasum formula
+  want="Claude Code-credentials-$(printf '%s' "/tmp/acct" | shasum -a 256 | cut -c1-8)"
+  eq "keychain service name for a dir" "$(cr_keychain_service "/tmp/acct")" "$want"
+  eq "keychain service name for default" "$(cr_keychain_service "")" "Claude Code-credentials"
+)
+
+echo "== launch: config dir + env scrub + args =="
+seed
+export ANTHROPIC_API_KEY="SHOULD_BE_SCRUBBED"
+export ANTHROPIC_AUTH_TOKEN="SHOULD_BE_SCRUBBED"
+export CLAUDE_CODE_OAUTH_TOKEN="SHOULD_BE_SCRUBBED"
+FAKE_EXIT=0 run_cr --account work --dangerously-skip-permissions -p "hello world"
+out="$(cat "$FAKE_OUT")"
+eq "forced account sets CLAUDE_CONFIG_DIR" \
+   "$(grep '^CONFIG_DIR=' <<<"$out")" "CONFIG_DIR=$CR_HOME/accounts/work"
+eq "API key scrubbed"   "$(grep '^API_KEY=' <<<"$out")"   "API_KEY=<unset>"
+eq "auth token scrubbed" "$(grep '^AUTH_TOKEN=' <<<"$out")" "AUTH_TOKEN=<unset>"
+eq "oauth token scrubbed" "$(grep '^OAUTH_TOKEN=' <<<"$out")" "OAUTH_TOKEN=<unset>"
+eq "args forwarded verbatim" \
+   "$(grep '^ARGS=' <<<"$out")" "ARGS=--dangerously-skip-permissions -p hello world"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+
+echo "== launch: default account leaves CLAUDE_CONFIG_DIR unset =="
+seed
+run_cr --account default -p hi
+eq "default account → CLAUDE_CONFIG_DIR unset" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=<unset>"
+
+echo "== launch: -- separator =="
+seed
+run_cr --account work -- --account zzz -p x
+eq "-- forwards the rest to claude verbatim" \
+   "$(grep '^ARGS=' "$FAKE_OUT")" "ARGS=--account zzz -p x"
+
+echo "== launch: exit code propagation =="
+seed
+FAKE_EXIT=7 "$CR" --account work -p x >/dev/null 2>&1
+eq "child exit code propagates" "$?" "7"
+
+echo "== launch: banner goes to stderr, not stdout =="
+seed
+"$CR" --account work -p x >"$SBX/stdout" 2>"$SBX/stderr"
+eq "stdout clean (banner on stderr)" "$(cat "$SBX/stdout")" ""
+if grep -q 'claude-router → work' "$SBX/stderr"; then ok "banner on stderr"; else bad "banner on stderr" "missing"; fi
+
+echo "== round-robin end to end =="
+seed
+for i in 1 2 3 4; do run_cr -p x; done
+# log should have 4 entries; counts across 3 accounts ~ even (2,1,1 in order a,b,c,a)
+counts="$(awk -F'\t' '{print $2}' "$CR_HOME/logs/route.log" | sort | uniq -c | awk '{print $1}' | sort | tr '\n' ' ')"
+eq "4 launches split 2/1/1 over 3 accounts" "$counts" "1 1 2 "
+
+echo "== single account: no rotation needed =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"solo","configDir":"$CR_HOME/accounts/solo","email":"s@x","plan":"max","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+run_cr -p x
+eq "single account is chosen" "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/solo"
+
+echo "== usage pct parsing (unit) =="
+( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
+  j='{"five_hour":{"utilization":42},"seven_day":{"utilization":61},"seven_day_opus":{"utilization":12}}'
+  eq "usage pct takes most-constrained bucket" "$(cr_usage_pct "$j")" "61"
+  j2='{"five_hour":17,"seven_day":9}'
+  eq "usage pct handles numeric buckets" "$(cr_usage_pct "$j2")" "17"
+)
+
+echo
+echo "== $PASS passed, $FAIL failed =="
+[[ "$FAIL" -eq 0 ]]
