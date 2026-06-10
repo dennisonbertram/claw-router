@@ -100,6 +100,7 @@ Launch (anything unrecognized is forwarded verbatim to `claude`):
 | `cr [args…]` | route by policy, then run `claude args…` |
 | `cr --account <name> [args…]` | force an account |
 | `cr@<name> [args…]` | shorthand for `--account <name>` |
+| `cr --sandbox` / `-s [args…]` | run the session inside a [cco](https://github.com/nikvdp/cco) sandbox |
 | `cr --account <name> -- [args…]` | `--` ends cr's flags; the rest is claude's |
 
 Manage (never forwarded to claude):
@@ -181,6 +182,30 @@ A backend launch sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
 and keychain tools keep working), and stores its API key under cr's own Keychain
 item (`claude-router-backend` / `<name>`). It's effectively `deep-claude` folded
 into `cr`.
+
+## Sandbox mode
+
+Add `--sandbox` (or `-s`) to run the session inside a container, so Claude Code
+can't touch anything outside your project:
+
+```sh
+cr --sandbox -p "run the migration and tests"
+cr@work -s                                   # sandboxed interactive session
+```
+
+This delegates isolation to [`cco`](https://github.com/nikvdp/cco) (“Claude
+Container”). `cr` still does the account routing — it picks the account, sets
+`CLAUDE_CONFIG_DIR`, then launches through `cco` instead of `claude`. Because
+`cco` reads the same `CLAUDE_CONFIG_DIR` (for both config *and* the Keychain
+login), the right account is used inside the box, and your normal policies,
+pins, backends, and `--resume` all compose with `--sandbox` unchanged.
+
+`cco` isn't bundled (it's a separate GPL-3.0 project). If it's missing, `cr`
+tells you the one-line install:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nikvdp/cco/master/install.sh | bash
+```
 
 ## Sessions across accounts
 

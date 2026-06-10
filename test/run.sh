@@ -259,6 +259,36 @@ run_cr --account home --resume "$SID_AD" -p x
 eq "adopted session resumable under target account" \
    "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/home"
 
+echo "== sandbox: --sandbox routes through cco, preserving account env =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/work"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+ {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"w@x","plan":"max","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+# Fake cco on PATH that records how it was invoked.
+cat > "$FAKEBIN/cco" <<'EOF'
+#!/usr/bin/env bash
+{ echo "VIA=cco"; echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"; echo "ARGS=$*"; } > "$FAKE_OUT"
+EOF
+chmod +x "$FAKEBIN/cco"
+run_cr --sandbox --account work -p "risky"
+out="$(cat "$FAKE_OUT")"
+eq "sandbox runs via cco"               "$(grep '^VIA=' <<<"$out")"        "VIA=cco"
+eq "sandbox preserves CLAUDE_CONFIG_DIR" "$(grep '^CONFIG_DIR=' <<<"$out")" "CONFIG_DIR=$CR_HOME/accounts/work"
+eq "sandbox forwards args after --"      "$(grep '^ARGS=' <<<"$out")"       "ARGS=-- -p risky"
+# -s shorthand in plain form
+run_cr -s --account work -p hi
+eq "-s shorthand triggers sandbox" "$(grep '^VIA=' "$FAKE_OUT")" "VIA=cco"
+# Without --sandbox, cco is NOT used (real/fake claude is).
+run_cr --account work -p hi
+eq "no --sandbox → does not use cco" "$(grep '^VIA=' "$FAKE_OUT" || echo 'VIA=claude')" "VIA=claude"
+rm -f "$FAKEBIN/cco"
+# Missing cco → fail fast, nonzero, no banner.
+FAKE_EXIT=0 "$CR" --sandbox --account work -p hi >"$SBX/stdout" 2>"$SBX/stderr"; rc=$?
+eq "missing cco exits nonzero" "$([[ $rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
+if grep -q 'cco' "$SBX/stderr"; then ok "missing cco explains how to install"; else bad "missing cco hint" "$(cat "$SBX/stderr")"; fi
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

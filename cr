@@ -41,6 +41,29 @@ cr_find_claude() {
   return 1
 }
 
+# Build the exec command for launching Claude Code, honoring sandbox mode.
+# Sets the array CR_EXEC to the argv prefix; the caller appends claude args.
+# In sandbox mode we run through `cco` (https://github.com/nikvdp/cco), which
+# reads CLAUDE_CONFIG_DIR for both config and Keychain naming and forwards args
+# after `--` straight to claude — so cr's per-account env carries into the box.
+CR_EXEC=()
+cr_build_exec() {
+  CR_EXEC=()
+  if [[ "${CR_SANDBOX:-0}" == 1 ]]; then
+    local cco; cco="$(command -v cco 2>/dev/null || true)"
+    if [[ -z "$cco" ]]; then
+      cr_die "--sandbox needs 'cco' (not found). Install it:
+    curl -fsSL https://raw.githubusercontent.com/nikvdp/cco/master/install.sh | bash
+  then re-run, or drop --sandbox. See: https://github.com/nikvdp/cco"
+    fi
+    # `cco -- <claude args>` forces passthrough (cco's own -p is --packages).
+    CR_EXEC=("$cco" "--")
+  else
+    local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
+    CR_EXEC=("$claude")
+  fi
+}
+
 # Detect a resume/continue invocation so we don't rotate onto the wrong account.
 # Echoes the kind on stdout: "resume <session-id>" | "resume" | "continue".
 cr_args_resume_kind() {
@@ -142,8 +165,8 @@ cr_launch() {
     "$C_DIM" "$([[ -n "$forced" ]] && echo "· forced" || echo "· $policy")" "$C_RESET" >&2
   printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$account" "${dir:-(default)}" >> "$CR_LOG" 2>/dev/null || true
 
-  local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
-  exec "$claude" "$@"
+  cr_build_exec
+  exec "${CR_EXEC[@]}" "$@"
 }
 
 # Launch a backend (alternate model endpoint, e.g. DeepSeek). Auth via env
@@ -183,8 +206,8 @@ cr_launch_backend() {
     "$C_DIM" "$C_RESET" >&2
   printf '%s\t%s\tbackend:%s\n' "$(date -u +%FT%TZ)" "$account" "$baseurl" >> "$CR_LOG" 2>/dev/null || true
 
-  local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
-  if [[ -n "$model" ]]; then exec "$claude" --model "$model" "$@"; else exec "$claude" "$@"; fi
+  cr_build_exec
+  if [[ -n "$model" ]]; then exec "${CR_EXEC[@]}" --model "$model" "$@"; else exec "${CR_EXEC[@]}" "$@"; fi
 }
 
 # ------------------------------------------------------------------------
@@ -558,6 +581,7 @@ cr_cmd_help() {
   cmd "cr@<name> [args]"           "shorthand for --account <name>"
   cmd "cr --account <name> -- ..."   "everything after -- is passed to claude"
   cmd "cr --resume <id>"           "resume any session — auto-linked into the picked account"
+  cmd "cr --sandbox  (-s) [args]"  "run the session inside a cco sandbox (isolation)"
 
   head "Accounts"
   cmd "cr add <name>"              "browser-login a subscription, cache identity"
@@ -605,6 +629,25 @@ cr_cmd_help() {
 # ------------------------------------------------------------------------
 main() {
   cr_require_deps
+
+  # Extract the cr-owned --sandbox / -s flag from the launch flags (everything
+  # up to a `--` separator, after which args belong to claude). Sets CR_SANDBOX.
+  CR_SANDBOX=0
+  local _a _rest=() _seen_sep=0
+  for _a in "$@"; do
+    if [[ "$_seen_sep" == 0 && ( "$_a" == "--sandbox" || "$_a" == "-s" ) ]]; then
+      CR_SANDBOX=1; continue
+    fi
+    [[ "$_a" == "--" ]] && _seen_sep=1
+    _rest+=("$_a")
+  done
+  set -- "${_rest[@]}"
+  # Fail fast on --sandbox without cco, before any banner/launch side effects.
+  if [[ "$CR_SANDBOX" == 1 ]] && ! command -v cco >/dev/null 2>&1; then
+    cr_die "--sandbox needs 'cco' (not found). Install it:
+    curl -fsSL https://raw.githubusercontent.com/nikvdp/cco/master/install.sh | bash
+  then re-run, or drop --sandbox. See: https://github.com/nikvdp/cco"
+  fi
 
   # cr@name shorthand
   if [[ "${1:-}" == cr@* ]]; then set -- --account "${1#cr@}" "${@:2}"; fi
