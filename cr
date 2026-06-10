@@ -427,7 +427,28 @@ Manage:
   cr usage [name]             show usage meters per window (--plain for one line)
   cr status                   show which account would run next
   cr doctor [name]            verify dirs + keychain credentials
-  cr help"
+  cr help                     this help
+
+First-time setup:
+  cr register-default                  # adopt your current ~/.claude login
+  cr add work                          # browser-login a 2nd subscription
+  cr add personal                      # …and a 3rd
+  cr list                              # confirm they're registered
+  cr -p \"hello\"                        # round-robins across them
+
+Examples:
+  cr                                   # interactive session on the next account
+  cr -p \"summarize this repo\"          # one-shot, picked by policy
+  cr --dangerously-skip-permissions    # any claude flag is forwarded as-is
+  cr@work -p \"draft the PR\"            # force the 'work' subscription
+  cr@deepseek --model flash -p \"…\"     # use a backend (DeepSeek), explicit only
+  cr policy usage-aware && cr usage    # route to whichever has the most headroom
+
+Notes:
+  • Plain 'cr' rotates over SUBSCRIPTION accounts only; backends are
+    explicit-only (cr@<name>) and never auto-selected.
+  • 'cr use <name>' pins an account; 'cr use --clear' returns to rotation.
+  • The banner (which account ran) prints to stderr, so 'cr -p' stdout stays clean."
 }
 
 # ------------------------------------------------------------------------
@@ -464,7 +485,10 @@ main() {
     status)           shift; cr_cmd_status ;;
     doctor)           shift; cr_doctor "${1:-}" ;;
     help|--help|-h)   cr_cmd_help ;;
-    "")               # plain `cr`: honor pinned default, else policy
+    "")               # plain `cr`: with no accounts yet, show help instead of erroring
+                      if [[ "$(cr_config_read | jq '.accounts|length')" -eq 0 ]]; then
+                        cr_cmd_help; return
+                      fi
                       local def; def="$(cr_config_read | jq -r '.defaultAccount // empty')"
                       cr_launch "$def" ;;
     *)                # anything else → claude args; route by policy/pin
