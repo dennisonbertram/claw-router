@@ -95,28 +95,23 @@ cr_launch() {
       [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
       cr_die "no accounts registered. Run: cr add <name>"
     fi
-    local rkind; rkind="$(cr_args_resume_kind "$@" || true)"
     if [[ "$n" -eq 1 ]]; then
       account="$(cr_enabled_accounts | head -1)"
-    elif [[ -n "$rkind" ]]; then
-      # Resume/continue: route to the account that actually owns the session,
-      # so transcripts from one account aren't looked for under another.
-      local sid="${rkind#resume }"; [[ "$rkind" == "$sid" ]] && sid=""  # only set for `resume <id>`
-      local owner=""
-      if [[ -n "$sid" ]]; then owner="$(cr_account_owning_session "$sid" || true)"; fi
-      if [[ -n "$owner" ]]; then
-        account="$owner"
-        cr_say "${C_DIM}resume → '${owner}' owns session ${sid:0:8}…${C_RESET}"
-      else
-        account="$(cr_select lru)"
-        if [[ -n "$sid" ]]; then
-          cr_warn "no account owns session ${sid:0:8}… — trying least-recently-used ('$account'). Pin with --account if wrong."
-        else
-          cr_warn "resume/continue without a session id can't be matched to an account — using least-recently-used ('$account'). Pin with --account, or pass the full session id."
-        fi
-      fi
     else
       account="$(cr_select "$policy")" || cr_die "selection failed for policy '$policy'"
+    fi
+  fi
+
+  # Resume/continue: make sure the chosen account can see the session. If another
+  # account owns it, transparently symlink it in so the resume just works.
+  local rkind sid; rkind="$(cr_args_resume_kind "$@" || true)"
+  if [[ -n "$rkind" ]]; then
+    sid="${rkind#resume }"; [[ "$rkind" == "$sid" ]] && sid=""   # set only for `resume <id>`
+    if [[ -n "$sid" ]]; then
+      if cr_link_session "$sid" "$account" >/dev/null 2>&1; then
+        cr_say "${C_DIM}resume → linked session ${sid:0:8}… into '${account}'${C_RESET}"
+      fi
+      # exit 1 (no owner) or 2 (already owned) → nothing to link; let claude handle it.
     fi
   fi
 
@@ -427,8 +422,42 @@ cr_cmd_usage() {
   fi
 }
 
-# Make a session owned by one account resumable under another, by symlinking the
-# transcript into the target account's config dir (same project path).
+# Symlink a session (transcript + subagents dir) from its owner into another
+# account's store, so the target can resume it. Returns nonzero if the owner or
+# transcript can't be found. Quiet by default; pass "verbose" as arg 3 to narrate.
+cr_link_session() {
+  local sid="$1" target="$2" verbose="${3:-}"
+  local owner; owner="$(cr_account_owning_session "$sid" || true)"
+  [[ -z "$owner" ]] && return 1
+  [[ "$owner" == "$target" ]] && return 2   # target already owns it
+
+  local src_base tgt_base
+  src_base="$(cr_account_dir "$owner" 2>/dev/null || true)"; src_base="${src_base:-$HOME/.claude}"
+  tgt_base="$(cr_account_dir "$target" 2>/dev/null || true)"; tgt_base="${tgt_base:-$HOME/.claude}"
+
+  local src_file proj
+  src_file="$(compgen -G "${src_base}/projects/*/${sid}.jsonl" 2>/dev/null | head -1)"
+  [[ -z "$src_file" ]] && return 1
+  proj="$(basename "$(dirname "$src_file")")"
+
+  local tgt_dir="${tgt_base}/projects/${proj}"
+  mkdir -p "$tgt_dir"
+  local tgt_file="${tgt_dir}/${sid}.jsonl"
+  [[ -e "$tgt_file" || -L "$tgt_file" ]] && rm -f "$tgt_file"
+  ln -s "$src_file" "$tgt_file"
+
+  local src_sub="${src_base}/projects/${proj}/${sid}"
+  if [[ -d "$src_sub" ]]; then
+    local tgt_sub="${tgt_dir}/${sid}"
+    [[ -e "$tgt_sub" || -L "$tgt_sub" ]] && rm -rf "$tgt_sub"
+    ln -s "$src_sub" "$tgt_sub"
+  fi
+  [[ "$verbose" == verbose ]] && cr_say "${C_DIM}linked session ${sid:0:8}… from '${owner}' → '${target}'${C_RESET}"
+  CR_LINK_OWNER="$owner"   # expose for callers
+  return 0
+}
+
+# Make a session owned by one account resumable under another (explicit command).
 #   cr adopt <session-id> <target-account>
 cr_cmd_adopt() {
   local sid="${1:-}" target="${2:-}"
@@ -437,39 +466,13 @@ cr_cmd_adopt() {
   cr_account_exists "$target" || cr_die "unknown target account: $target"
   [[ "$(cr_account_kind "$target")" == "backend" ]] && cr_die "backends don't store sessions; pick a subscription account"
 
-  local owner; owner="$(cr_account_owning_session "$sid" || true)"
-  [[ -z "$owner" ]] && cr_die "no account owns session ${sid} (nothing to adopt)"
-  [[ "$owner" == "$target" ]] && cr_die "'$target' already owns that session"
-
-  local src_base tgt_base
-  src_base="$(cr_account_dir "$owner" 2>/dev/null || true)"; src_base="${src_base:-$HOME/.claude}"
-  tgt_base="$(cr_account_dir "$target" 2>/dev/null || true)"; tgt_base="${tgt_base:-$HOME/.claude}"
-
-  # Locate the transcript and its enclosing project dir under the owner.
-  local src_file proj
-  src_file="$(compgen -G "${src_base}/projects/*/${sid}.jsonl" 2>/dev/null | head -1)"
-  [[ -z "$src_file" ]] && cr_die "could not locate transcript for ${sid} under '$owner'"
-  proj="$(basename "$(dirname "$src_file")")"
-
-  local tgt_dir="${tgt_base}/projects/${proj}"
-  mkdir -p "$tgt_dir"
-  local tgt_file="${tgt_dir}/${sid}.jsonl"
-  if [[ -e "$tgt_file" || -L "$tgt_file" ]]; then
-    cr_warn "target already has ${sid}.jsonl — replacing the link"
-    rm -f "$tgt_file"
-  fi
-  ln -s "$src_file" "$tgt_file"
-
-  # Subagent transcripts live in a sibling <id>/ dir; link it too if present.
-  local src_sub="${src_base}/projects/${proj}/${sid}"
-  if [[ -d "$src_sub" ]]; then
-    local tgt_sub="${tgt_dir}/${sid}"
-    [[ -e "$tgt_sub" || -L "$tgt_sub" ]] && rm -rf "$tgt_sub"
-    ln -s "$src_sub" "$tgt_sub"
-  fi
-
-  cr_say "Adopted session ${sid:0:8}… : '${owner}' → '${target}' (symlinked, shared history)."
-  cr_say "Resume it under the target with:  cr@${target} --resume ${sid}"
+  cr_link_session "$sid" "$target"
+  case $? in
+    0) cr_say "Adopted session ${sid:0:8}… → '${target}' (symlinked, shared history)."
+       cr_say "Resume it under the target with:  cr@${target} --resume ${sid}" ;;
+    2) cr_die "'$target' already owns that session" ;;
+    *) cr_die "no account owns session ${sid} (nothing to adopt)" ;;
+  esac
 }
 
 cr_cmd_status() {
@@ -554,6 +557,7 @@ cr_cmd_help() {
   cmd "cr --account <name> [args]" "force a specific account for this run"
   cmd "cr@<name> [args]"           "shorthand for --account <name>"
   cmd "cr --account <name> -- ..."   "everything after -- is passed to claude"
+  cmd "cr --resume <id>"           "resume any session — auto-linked into the picked account"
 
   head "Accounts"
   cmd "cr add <name>"              "browser-login a subscription, cache identity"
@@ -570,7 +574,7 @@ cr_cmd_help() {
   cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
 
   head "Sessions"
-  cmd "cr adopt <id> <account>"    "let <account> resume a session owned by another (symlink)"
+  cmd "cr adopt <id> <account>"    "manually link a session into <account> (--resume does this automatically)"
 
   head "Inspect"
   cmd "cr usage [name]"            "usage meters per window (--plain = one line)"

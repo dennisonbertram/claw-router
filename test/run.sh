@@ -225,7 +225,7 @@ so="$("$CR" status 2>&1)"; rc=$?
 eq "status exits 0 without cache" "$rc" "0"
 if grep -q 'cr usage' <<<"$so"; then ok "status hints to run cr usage"; else bad "status hint" "$so"; fi
 
-echo "== resume routes to the account that owns the session =="
+echo "== resume auto-symlinks the session into the picked account =="
 rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/work/projects/-proj" "$CR_HOME/accounts/home"
 cat > "$CR_HOME/config.json" <<JSON
 {"selection":"round-robin","accounts":[
@@ -233,14 +233,18 @@ cat > "$CR_HOME/config.json" <<JSON
   {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"w@x","plan":"max","lastUsed":99,"enabled":true}],
  "rotation":{"cursor":0},"share":{}}
 JSON
+# Session owned by 'work'; resume rotates to the picked account and auto-links it in.
 SID_OWN="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-echo '{}' > "$CR_HOME/accounts/work/projects/-proj/$SID_OWN.jsonl"   # owned by 'work' (NOT the lru)
-run_cr --resume "$SID_OWN" -p x
-eq "resume routes to owning account (work), not lru (home)" \
-   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/work"
-# Unknown session id → falls back to lru (home), doesn't crash.
-run_cr --resume "deadbeef-0000-0000-0000-000000000000" -p x
-eq "unknown session falls back to lru (home)" \
+echo '{"o":"work"}' > "$CR_HOME/accounts/work/projects/-proj/$SID_OWN.jsonl"
+run_cr --account home --resume "$SID_OWN" -p x   # pin home so the assert is deterministic
+eq "resume runs under the picked account (home)" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/home"
+linkres="$CR_HOME/accounts/home/projects/-proj/$SID_OWN.jsonl"
+if [[ -L "$linkres" ]]; then ok "resume auto-symlinks the session into the picked account"; else bad "resume auto-symlink" "not a symlink: $linkres"; fi
+eq "auto-linked session resolves to owner's content" "$(cat "$linkres" 2>/dev/null)" '{"o":"work"}'
+# Unknown session id → no link made, no crash, runs under picked account.
+run_cr --account home --resume "deadbeef-0000-0000-0000-000000000000" -p x
+eq "unknown session still launches (claude reports not-found)" \
    "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/home"
 
 echo "== adopt symlinks a session into another account =="
