@@ -1,15 +1,48 @@
-# claude-router (`cr`)
+<p align="center">
+  <img src="assets/banner.png" alt="Claude Router" width="100%">
+</p>
 
-Run Claude Code across several Claude subscriptions from one command. Type `cr`
-followed by any normal `claude` arguments; `cr` picks an account (round-robin by
-default), tells you which one it's using, and launches Claude Code under that
-account's credentials — so your usage spreads out and lasts longer.
+<h1 align="center">Claude Router</h1>
 
-```
+<p align="center">
+  <b>One command. All your Claude subscriptions. Used evenly, so they last.</b>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#selection-policies">Policies</a> ·
+  <a href="#how-it-works">How it works</a>
+</p>
+
+<p align="center">
+  <code>cr</code> is a tiny wrapper around <a href="https://claude.com/claude-code">Claude Code</a>.
+  Type <code>cr</code> followed by any normal <code>claude</code> arguments and it
+  picks one of your Claude accounts (round-robin by default), tells you which, and
+  launches Claude Code under that account — spreading the load so no single
+  subscription burns out first.
+</p>
+
+```console
 $ cr -p "explain this repo"
-▶ claude-router → work  you@work.com  (claude_max)  [policy: round-robin]
+◆ work  you@work.com  (claude_max) · round-robin
 …claude runs normally…
+
+$ cr -p "and the tests?"
+◆ personal  you@gmail.com  (claude_max) · round-robin
+…next call, next account…
 ```
+
+If you keep two or three Claude Max plans around so you don't hit the 5-hour
+limit mid-flow, this is for you: stop manually `/login`-swapping, and let `cr`
+balance them — including a `usage-aware` mode that routes to whichever account
+has the most headroom right now.
+
+> **Your secrets never move.** `cr` flips one environment variable
+> (`CLAUDE_CONFIG_DIR`) per launch; Claude Code reads the right macOS Keychain
+> login and refreshes its own token. `cr` never reads, copies, or stores your
+> credentials.
 
 ## How it works
 
@@ -35,12 +68,18 @@ never modified.
 ## Install
 
 ```sh
-git clone <this repo> ~/.claude-router-src   # or wherever
-ln -s ~/.claude-router-src/cr ~/.local/bin/cr   # ensure ~/.local/bin is on PATH
+git clone https://github.com/dennisonbertram/claude-router.git
+cd claude-router
+./install.sh          # symlinks `cr` into ~/.local/bin
 ```
 
-Requires `jq` (and `curl` for `cr usage`). On macOS these plus `security`,
-`shasum`, and `python3` are already present or one `brew install jq` away.
+Make sure `~/.local/bin` is on your `PATH`. The only hard dependency is `jq`
+(`brew install jq`); `curl` is needed for `cr usage`, and `security` / `shasum`
+/ `python3` ship with macOS.
+
+> **Platform:** macOS-first (it builds on the macOS Keychain). It runs on Linux
+> too — credentials come from `CLAUDE_CONFIG_DIR/.credentials.json` instead — but
+> the Keychain checks in `cr doctor` are skipped there.
 
 ## Quick start
 
@@ -192,4 +231,14 @@ bash test/run.sh
 ```
 
 No real Claude or network calls — uses a fake `claude` and an isolated config
-home.
+home. 30+ assertions cover account selection, env scrubbing, arg forwarding,
+the Keychain naming scheme, backend isolation, usage rendering, and
+cross-account session linking.
+
+## License
+
+MIT © Dennison Bertram
+
+---
+
+<p align="center"><i>Not affiliated with Anthropic. “Claude” and “Claude Code” are trademarks of Anthropic.</i></p>
