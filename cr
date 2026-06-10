@@ -387,6 +387,15 @@ cr_cmd_usage() {
 
 cr_cmd_status() {
   cr_ensure_home
+  # Optional: refresh live usage before drawing (otherwise use cached snapshot).
+  if [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]]; then
+    if cr_have curl; then
+      cr_say "${C_DIM}refreshing usage…${C_RESET}"
+      local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_enabled_accounts)
+    else
+      cr_warn "curl not found — showing cached usage"
+    fi
+  fi
   local policy def n
   policy="$(cr_config_read | jq -r '.selection // "round-robin"')"
   def="$(cr_config_read | jq -r '.defaultAccount // empty')"
@@ -408,7 +417,13 @@ cr_cmd_status() {
       printf '  %snext%s   %s%s%s\n' "$C_GREY" "$C_RESET" "$C_DIM" "$note" "$C_RESET" >&2
     fi
   fi
+
+  # Per-account usage dashboard (cached; pass --refresh to poll live first).
   printf '\n' >&2
+  if ! cr_render_cached_bars; then
+    printf '  %sno usage cached yet — run %scr usage%s%s or %scr status --refresh%s\n\n' \
+      "$C_DIM" "$C_CYAN" "$C_RESET$C_DIM" "" "$C_CYAN" "$C_RESET" >&2
+  fi
 }
 
 cr_doctor() {
@@ -465,7 +480,7 @@ cr_cmd_help() {
   cmd "cr policy <p>"              "round-robin | lru | random | usage-aware"
   cmd "cr use <name>"              "pin the account a plain 'cr' uses"
   cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
-  cmd "cr status"                  "show which account would run next, and why"
+  cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
 
   head "Inspect"
   cmd "cr usage [name]"            "usage meters per window (--plain = one line)"
@@ -522,7 +537,7 @@ main() {
     unuse)            shift; cr_cmd_unuse ;;
     policy)           shift; cr_cmd_policy "$@" ;;
     usage)            shift; cr_cmd_usage "$@" ;;
-    status)           shift; cr_cmd_status ;;
+    status)           shift; cr_cmd_status "$@" ;;
     doctor)           shift; cr_doctor "${1:-}" ;;
     help|--help|-h)   cr_cmd_help ;;
     "")               # plain `cr`: with no accounts yet, show help instead of erroring

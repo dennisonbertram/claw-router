@@ -77,7 +77,7 @@ Manage (never forwarded to claude):
 | `cr use --clear` (`cr unuse`) | un-pin; go back to the rotation policy |
 | `cr policy <p>` | `round-robin` \| `lru` \| `random` \| `usage-aware` |
 | `cr usage [name]` | show usage meters per window (`--plain` for one-line text) |
-| `cr status` | which account would run next, and why |
+| `cr status [--refresh]` | dashboard: next pick + per-account usage bars (cached; `--refresh` polls live) |
 | `cr doctor [name]` | verify each account's dir + keychain credential |
 
 ## Selection policies

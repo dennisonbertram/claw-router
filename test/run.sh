@@ -195,6 +195,36 @@ echo "== backend: alias resolves pro/flash =="
   eq "flash alias maps to full model" "$al" "deepseek-v4-flash"
 )
 
+echo "== status: renders cached usage bars for all accounts =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"email":"a@x","plan":"max","lastUsed":0,"enabled":true,
+   "usagePct":42,"usage":{"checkedAt":1700000000000,"windows":[
+     {"label":"5h session","used":42,"resets":null},
+     {"label":"7d total","used":12,"resets":null}]}},
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"b@x","plan":"max","lastUsed":0,"enabled":true,
+   "usagePct":90,"usage":{"checkedAt":1700000000000,"windows":[
+     {"label":"5h session","used":90,"resets":null}]}}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+status_out="$("$CR" status 2>&1)"
+if grep -q 'default' <<<"$status_out" && grep -q 'work' <<<"$status_out"; then ok "status lists all accounts"; else bad "status lists all accounts" "$status_out"; fi
+if grep -q '58% left' <<<"$status_out"; then ok "status shows 'left' for 42% used (default)"; else bad "status 58% left" "$status_out"; fi
+if grep -q '10% left' <<<"$status_out"; then ok "status shows 10% left for 90% used (work)"; else bad "status 10% left" "$status_out"; fi
+if grep -qE '█|░' <<<"$status_out"; then ok "status draws bar glyphs"; else bad "status bar glyphs" "$status_out"; fi
+
+echo "== status: no cache → friendly hint, no crash =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"solo","kind":"subscription","configDir":null,"email":"s@x","plan":"max","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+so="$("$CR" status 2>&1)"; rc=$?
+eq "status exits 0 without cache" "$rc" "0"
+if grep -q 'cr usage' <<<"$so"; then ok "status hints to run cr usage"; else bad "status hint" "$so"; fi
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

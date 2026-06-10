@@ -117,10 +117,7 @@ cr_render_account_meters() {
 
   email="$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.email // ""')"
   pct="$(cr_usage_pct "$raw")"
-  if [[ -n "$pct" ]]; then
-    cr_config_update '(.accounts[] | select(.name==$n) | .usagePct) = ($p|tonumber)' \
-      --arg n "$name" --arg p "$pct" >/dev/null
-  fi
+  [[ -n "$pct" ]] && cr_cache_usage "$name" "$pct" "$raw"
 
   printf '\n  \033[1m%s\033[0m  %s\n' "$name" "$email" >&2
 
@@ -165,6 +162,79 @@ cr_render_meters() {
   printf '\n' >&2
 }
 
+# Cache usagePct + a compact per-window snapshot + a timestamp into the registry,
+# so `cr status` can draw bars instantly without hitting the network.
+# Stored shape:  .usagePct (number)  .usage = { checkedAt, windows: [{label,used,resets}] }
+cr_cache_usage() {
+  local name="$1" pct="$2" raw="$3" now_ms win_json
+  now_ms="$(( $(date +%s) * 1000 ))"
+  win_json="$(printf '%s' "$raw" | jq -c '
+    . as $r
+    | [ {k:"five_hour",lab:"5h session"}, {k:"seven_day",lab:"7d total"},
+        {k:"seven_day_opus",lab:"7d Opus"}, {k:"seven_day_sonnet",lab:"7d Sonnet"} ]
+    | map(. as $e | ($r[$e.k]) as $w | select($w != null)
+          | {label:$e.lab, used:($w.utilization // $w), resets:($w.resets_at // null)})' 2>/dev/null)"
+  [[ -z "$win_json" || "$win_json" == "null" ]] && win_json='[]'
+  cr_config_update '
+    (.accounts[] | select(.name==$n) | .usagePct) = ($p|tonumber)
+    | (.accounts[] | select(.name==$n) | .usage) = {checkedAt:($t|tonumber), windows:$w}' \
+    --arg n "$name" --arg p "$pct" --arg t "$now_ms" --argjson w "$win_json" >/dev/null
+}
+
+# Render cached usage bars for every enabled account to stderr — no network.
+# Reads the .usage snapshot saved by the last `cr usage` / `--refresh`.
+cr_render_cached_bars() {
+  local rows; rows="$(cr_config_read)"
+  local any=0 name email pct checked
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    email="$(printf '%s' "$rows" | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.email // ""')"
+    pct="$(printf '%s' "$rows"   | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.usagePct // empty')"
+    checked="$(printf '%s' "$rows" | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.usage.checkedAt // empty')"
+
+    printf '  %s◆ %s%s  %s%s%s' "$C_ACCENT$C_BOLD" "$name" "$C_RESET" "$C_GREY" "$email" "$C_RESET" >&2
+    if [[ -n "$checked" ]]; then
+      printf '  %s%s%s\n' "$C_DIM" "($(cr_age_human "$checked") ago)" "$C_RESET" >&2
+    else
+      printf '\n' >&2
+    fi
+
+    local wins; wins="$(printf '%s' "$rows" | jq -c --arg n "$name" \
+      '.accounts[]|select(.name==$n)|.usage.windows // []')"
+    if [[ "$wins" == "[]" || -z "$wins" ]]; then
+      printf '    %sno usage data — run %scr usage%s%s\n' "$C_DIM" "$C_CYAN" "$C_RESET$C_DIM" "$C_RESET" >&2
+    else
+      any=1
+      local lab used resets left bar color rh suffix
+      while IFS=$'\t' read -r lab used resets; do
+        [[ -z "$lab" ]] && continue
+        left="$(awk -v u="$used" 'BEGIN{printf "%.0f", 100-u}')"
+        bar="$(cr_bar "$left" 20)"; color="$(cr_bar_color "$left")"; rh="$(cr_fmt_reset "$resets")"
+        suffix=""
+        [[ -n "$rh" ]] && suffix="   ${C_GREY}resets in ${rh}${C_RESET}"
+        if [[ -n "$color" ]]; then
+          printf '    %-11s \033[%sm%s\033[0m %3s%% left%s\n' "$lab" "$color" "$bar" "$left" "$suffix" >&2
+        else
+          printf '    %-11s %s %3s%% left%s\n' "$lab" "$bar" "$left" "$suffix" >&2
+        fi
+      done < <(printf '%s' "$wins" | jq -r '.[] | "\(.label)\t\(.used)\t\(.resets // "")"')
+    fi
+    printf '\n' >&2
+  done < <(cr_enabled_accounts)
+  return $(( any ? 0 : 1 ))
+}
+
+# Humanize a ms-epoch timestamp as "3m" / "2h" / "5d" elapsed.
+cr_age_human() {
+  local then_ms="$1" now_s then_s d
+  now_s="$(date +%s)"; then_s=$(( then_ms / 1000 )); d=$(( now_s - then_s ))
+  (( d < 0 )) && d=0
+  if   (( d < 90 ));    then printf '%ds' "$d"
+  elif (( d < 5400 ));  then printf '%dm' $(( (d+30)/60 ))
+  elif (( d < 172800 ));then printf '%dh' $(( (d+1800)/3600 ))
+  else printf '%dd' $(( (d+43200)/86400 )); fi
+}
+
 # Poll one account and cache its usagePct + a short summary into the registry.
 # Echoes a human summary line. Best-effort.
 cr_poll_account() {
@@ -173,8 +243,7 @@ cr_poll_account() {
   raw="$(cr_fetch_usage_raw "$dir")" || { cr_warn "usage poll failed for '$name'"; return 1; }
   pct="$(cr_usage_pct "$raw")"
   if [[ -n "$pct" ]]; then
-    cr_config_update '(.accounts[] | select(.name==$n) | .usagePct) = ($p|tonumber)' \
-      --arg n "$name" --arg p "$pct" >/dev/null
+    cr_cache_usage "$name" "$pct" "$raw"
     # Per-window breakdown (5h / 7d), with reset times when present.
     line="$(printf '%s' "$raw" | jq -r '
       def w(o): if o==null then empty
