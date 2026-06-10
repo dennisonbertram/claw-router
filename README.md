@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Claude Router" width="100%">
+  <img src="assets/banner.png" alt="Claw Router" width="100%">
 </p>
 
-<h1 align="center">Claude Router</h1>
+<h1 align="center">Claw Router 🦞</h1>
 
 <p align="center">
-  <b>One command. All your Claude subscriptions. Used evenly, so they last.</b>
+  <b>Effortlessly manage your Claude subscriptions.</b><br>
+  One command. All your accounts. Used evenly, so they last.
 </p>
 
 <p align="center">
@@ -68,8 +69,8 @@ never modified.
 ## Install
 
 ```sh
-git clone https://github.com/dennisonbertram/claude-router.git
-cd claude-router
+git clone https://github.com/dennisonbertram/claw-router.git
+cd claw-router
 ./install.sh          # symlinks `cr` into ~/.local/bin
 ```
 

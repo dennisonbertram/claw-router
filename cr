@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cr — Claude Router. Pick one of your Claude subscriptions and launch Claude
+# cr — Claw Router 🦞. Pick one of your Claude subscriptions and launch Claude
 # Code under it, spreading usage so it lasts longer.
 #
 #   cr [claude args...]          route per policy, then exec claude
@@ -572,7 +572,7 @@ cr_cmd_help() {
   head() { printf '\n%s%s%s\n' "$b" "$1" "$r" >&2; }
   ex()  { printf '  %s%-36s%s %s%s%s\n' "$gn" "$1" "$r" "$d" "$2" "$r" >&2; }
 
-  printf '\n  %s◆ claude-router%s %s(cr)%s  %s— spread Claude Code across your subscriptions%s\n' \
+  printf '\n  %s🦞 Claw Router%s %s(cr)%s  %s— effortlessly manage your Claude subscriptions%s\n' \
     "$a$b" "$r" "$d" "$r" "$d" "$r" >&2
 
   head "Launch"

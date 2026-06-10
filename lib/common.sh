@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# common.sh — shared helpers for claude-router (cr).
+# common.sh — shared helpers for Claw Router (cr).
 # Sourced by `cr` and by the test harness. No side effects on source beyond
 # defining functions and the CR_HOME/CONFIG path vars.
 
