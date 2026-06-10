@@ -136,6 +136,64 @@ echo "== usage pct parsing (unit) =="
   eq "usage pct handles numeric buckets" "$(cr_usage_pct "$j2")" "17"
 )
 
+echo "== backend: excluded from rotation =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"email":"a@x","plan":"max","lastUsed":0,"enabled":true},
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"b@x","plan":"max","lastUsed":0,"enabled":true},
+  {"name":"deepseek","kind":"backend","configDir":null,"baseUrl":"https://api.deepseek.com/anthropic","model":"deepseek-v4-pro","modelAliases":{"pro":"deepseek-v4-pro","flash":"deepseek-v4-flash"},"apiKey":"sk-ds-test","email":null,"plan":"backend","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+( source "$CR_REPO/lib/common.sh"
+  pool="$(cr_enabled_accounts | tr '\n' ',')"
+  eq "rotation pool excludes backend" "$pool" "default,work,"
+  eq "account kind reported" "$(cr_account_kind deepseek)" "backend"
+)
+# Round-robin over 4 launches must never pick the backend.
+for i in 1 2 3 4; do run_cr -p x; done
+if grep -q 'deepseek' "$CR_HOME/logs/route.log"; then bad "backend never auto-selected" "deepseek appeared in route log"; else ok "backend never auto-selected"; fi
+
+echo "== backend: explicit launch sets env, not CLAUDE_CONFIG_DIR =="
+run_cr --account deepseek --model flash -p hi
+out="$(cat "$FAKE_OUT")"
+eq "backend sets ANTHROPIC_BASE_URL" \
+  "$(grep '^ARGS=' <<<"$out")" "ARGS=--model deepseek-v4-flash -p hi"
+# The fake claude doesn't echo base url; assert via a richer stub below.
+
+echo "== backend: env vars + key resolution (config fallback) =="
+cat > "$FAKEBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+{ echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "BASE_URL=${ANTHROPIC_BASE_URL-<unset>}"
+  echo "AUTH=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "MODEL_ENV=${ANTHROPIC_MODEL-<unset>}"
+  echo "HOME_KEPT=${HOME}"
+  echo "ARGS=$*"; } > "$FAKE_OUT"
+EOF
+chmod +x "$FAKEBIN/claude"
+HOME_BEFORE="$HOME"
+run_cr --account deepseek -p hi
+out="$(cat "$FAKE_OUT")"
+eq "backend: CLAUDE_CONFIG_DIR unset"        "$(grep '^CONFIG_DIR=' <<<"$out")" "CONFIG_DIR=<unset>"
+eq "backend: base url set"                   "$(grep '^BASE_URL=' <<<"$out")"   "BASE_URL=https://api.deepseek.com/anthropic"
+eq "backend: auth token = api key (config)"  "$(grep '^AUTH=' <<<"$out")"       "AUTH=sk-ds-test"
+eq "backend: model env set (default)"        "$(grep '^MODEL_ENV=' <<<"$out")"  "MODEL_ENV=deepseek-v4-pro"
+eq "backend: HOME left untouched"            "$(grep '^HOME_KEPT=' <<<"$out")"  "HOME_KEPT=$HOME_BEFORE"
+# restore the original fake for any later tests
+cat > "$FAKEBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+{ echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"; echo "ARGS=$*"; } > "$FAKE_OUT"
+exit "${FAKE_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/claude"
+
+echo "== backend: alias resolves pro/flash =="
+( source "$CR_REPO/lib/common.sh"
+  al="$(cr_config_read | jq -r '.accounts[]|select(.name=="deepseek")|.modelAliases.flash')"
+  eq "flash alias maps to full model" "$al" "deepseek-v4-flash"
+)
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

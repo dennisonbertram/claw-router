@@ -62,7 +62,12 @@ cr_launch() {
     account="$forced"
   else
     local n; n="$(cr_enabled_accounts | grep -c . || true)"
-    [[ "$n" -eq 0 ]] && cr_die "no accounts registered. Run: cr add <name>"
+    if [[ "$n" -eq 0 ]]; then
+      # No subscriptions to rotate. If a backend exists, name it in the hint.
+      local be; be="$(cr_config_read | jq -r '[.accounts[]|select((.kind//"subscription")=="backend")][0].name // empty')"
+      [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
+      cr_die "no accounts registered. Run: cr add <name>"
+    fi
     if [[ "$n" -eq 1 ]]; then
       account="$(cr_enabled_accounts | head -1)"
     elif cr_args_have_resume "$@"; then
@@ -73,8 +78,16 @@ cr_launch() {
     fi
   fi
 
-  local dir; dir="$(cr_account_dir "$account")" || cr_die "cannot resolve dir for '$account'"
+  local kind; kind="$(cr_account_kind "$account")"
   cr_mark_used "$account"
+
+  if [[ "$kind" == "backend" ]]; then
+    cr_launch_backend "$account" "$forced" "$@"
+    return
+  fi
+
+  # --- subscription account ------------------------------------------------
+  local dir; dir="$(cr_account_dir "$account")" || cr_die "cannot resolve dir for '$account'"
 
   # Identity for the banner (cached; no network).
   local email plan
@@ -90,6 +103,43 @@ cr_launch() {
 
   local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
   exec "$claude" "$@"
+}
+
+# Launch a backend (alternate model endpoint, e.g. DeepSeek). Auth via env
+# vars; HOME is left untouched so gh/keychain tools keep working.
+cr_launch_backend() {
+  local account="$1"; shift
+  local forced="$1"; shift
+
+  local baseurl model key
+  baseurl="$(cr_config_read | jq -r --arg n "$account" '.accounts[]|select(.name==$n)|.baseUrl // empty')"
+  model="$(cr_config_read   | jq -r --arg n "$account" '.accounts[]|select(.name==$n)|.model // empty')"
+  [[ -z "$baseurl" ]] && cr_die "backend '$account' has no baseUrl configured"
+  key="$(cr_backend_key "$account")" || cr_die "no API key for backend '$account' (set one: cr add-backend ...)"
+
+  # Allow an inline `--model pro|flash|NAME` override before claude args.
+  if [[ "${1:-}" == "--model" && -n "${2:-}" ]]; then
+    case "$2" in pro) model="${model_pro:-$2}";; flash) model="${model_flash:-$2}";; *) model="$2";; esac
+    # resolve aliases stored on the account
+    local al; al="$(cr_config_read | jq -r --arg n "$account" --arg a "$2" \
+      '.accounts[]|select(.name==$n)|.modelAliases[$a] // empty')"
+    [[ -n "$al" ]] && model="$al"
+    shift 2
+  fi
+  [[ "${1:-}" == "--" ]] && shift
+
+  # Backend auth is via these env vars — set, don't scrub. Leave HOME alone.
+  export ANTHROPIC_BASE_URL="$baseurl"
+  export ANTHROPIC_AUTH_TOKEN="$key"
+  export ANTHROPIC_API_KEY="$key"
+  [[ -n "$model" ]] && export ANTHROPIC_MODEL="$model"
+  unset CLAUDE_CONFIG_DIR
+
+  cr_say "▶ claude-router → ${account}  (backend: ${baseurl##https://})  model=${model:-default}  [explicit]"
+  printf '%s\t%s\tbackend:%s\n' "$(date -u +%FT%TZ)" "$account" "$baseurl" >> "$CR_LOG" 2>/dev/null || true
+
+  local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
+  if [[ -n "$model" ]]; then exec "$claude" --model "$model" "$@"; else exec "$claude" "$@"; fi
 }
 
 # ------------------------------------------------------------------------
@@ -132,6 +182,63 @@ cr_cmd_add() {
   cr_doctor "$name" || true
 }
 
+# Register a backend account (alternate model endpoint, e.g. DeepSeek).
+# Backends are NEVER in rotation — reach them with: cr@<name> / cr --account <name>.
+#   cr add-backend <name> [--base-url URL] [--model NAME]
+#                         [--alias short=full ...] [--seed-from-deep-claude]
+cr_cmd_add_backend() {
+  local name="${1:-}"; shift || true
+  [[ -z "$name" ]] && cr_die "usage: cr add-backend <name> [--base-url URL] [--model NAME] [--alias s=full] [--seed-from-deep-claude]"
+  cr_ensure_home
+  cr_account_exists "$name" && cr_die "account '$name' already exists"
+
+  local baseurl="https://api.deepseek.com/anthropic" model="deepseek-v4-pro"
+  local seed_dc=0 key=""
+  local aliases='{"pro":"deepseek-v4-pro","flash":"deepseek-v4-flash"}'
+  while (($#)); do
+    case "$1" in
+      --base-url) baseurl="${2:?--base-url needs a value}"; shift 2 ;;
+      --model)    model="${2:?--model needs a value}"; shift 2 ;;
+      --alias)    local kv="${2:?--alias needs short=full}"; shift 2
+                  aliases="$(printf '%s' "$aliases" | jq --arg k "${kv%%=*}" --arg v "${kv#*=}" '.[$k]=$v')" ;;
+      --seed-from-deep-claude) seed_dc=1; shift ;;
+      *) cr_die "add-backend: unknown flag '$1'" ;;
+    esac
+  done
+
+  # Obtain the key: seed from deep-claude's keychain, else prompt.
+  if (( seed_dc )); then
+    cr_have security || cr_die "--seed-from-deep-claude needs the macOS 'security' tool"
+    key="$(security find-generic-password -s deep-claude -a deepseek -w 2>/dev/null)" \
+      || cr_die "no deep-claude key found (service 'deep-claude', account 'deepseek')"
+    cr_say "Seeded key from deep-claude's keychain item."
+  else
+    printf 'Enter API key for backend "%s" (input hidden): ' "$name" >&2
+    read -rs key; printf '\n' >&2
+    [[ -z "$key" ]] && cr_die "no key entered"
+  fi
+
+  # Store the key under cr's own keychain item (macOS), else plaintext in config.
+  local stored="keychain"
+  if cr_have security; then
+    security add-generic-password -U -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" -w "$key" 2>/dev/null \
+      || cr_die "failed to store key in keychain"
+  else
+    stored="config"
+  fi
+
+  cr_config_update '.accounts += [{
+      name:$n, kind:"backend", configDir:null,
+      baseUrl:$b, model:$m, modelAliases:$al,
+      email:null, plan:"backend", lastUsed:0, enabled:true, usagePct:null,
+      apiKey: (if $store=="config" then $k else null end) }]' \
+    --arg n "$name" --arg b "$baseurl" --arg m "$model" \
+    --argjson al "$aliases" --arg store "$stored" --arg k "$key"
+
+  cr_say "Added backend '$name' → $baseurl  (model=$model, key in $stored)."
+  cr_say "It is NOT in rotation. Use it explicitly:  cr@$name [--model pro|flash] [claude args...]"
+}
+
 # Register the existing ~/.claude login as an account (default has no dir).
 cr_cmd_register_default() {
   local name="${1:-default}"
@@ -169,10 +276,16 @@ cr_cmd_logout() {
 cr_cmd_remove() {
   local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr remove <name>"
   cr_account_exists "$name" || cr_die "unknown account: $name"
-  local dir; dir="$(cr_account_dir "$name")"
+  local kind; kind="$(cr_account_kind "$name")"
+  local dir; dir="$(cr_account_dir "$name" 2>/dev/null || true)"
   cr_config_update 'del(.accounts[] | select(.name==$n))' --arg n "$name"
   cr_say "Unregistered '$name'."
-  if [[ -n "$dir" && -d "$dir" ]]; then
+  if [[ "$kind" == "backend" ]]; then
+    if cr_have security && security find-generic-password -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" >/dev/null 2>&1; then
+      cr_say "Its API key is still in your keychain. Remove it with:"
+      cr_say "  security delete-generic-password -s '$CR_BACKEND_KEYCHAIN_SVC' -a '$name'"
+    fi
+  elif [[ -n "$dir" && -d "$dir" ]]; then
     cr_say "Its config dir still exists: $dir"
     cr_say "  Remove it with:  rm -rf '$dir'"
     cr_say "  Remove its keychain item with:  security delete-generic-password -s '$(cr_keychain_service "$dir")' -a '${USER}'"
@@ -213,15 +326,18 @@ cr_cmd_list() {
     return 0
   fi
   printf '%s\n' "$rows" | jq -r '
-    "NAME\tEMAIL\tPLAN\tLAST USED\tUSAGE\tON",
+    "NAME\tKIND\tEMAIL / ENDPOINT\tPLAN / MODEL\tLAST USED\tUSAGE\tON\tROTATES",
     (.accounts[] |
+      ( (.kind // "subscription") ) as $k |
       [ .name,
-        (.email // "?"),
-        (.plan // "?"),
+        $k,
+        (if $k=="backend" then (.baseUrl // "?" | sub("^https?://";"")) else (.email // "?") end),
+        (if $k=="backend" then (.model // "?") else (.plan // "?") end),
         (if (.lastUsed // 0) == 0 then "never"
          else (.lastUsed/1000 | strftime("%Y-%m-%d %H:%M")) end),
         (if .usagePct == null then "-" else "\(.usagePct|floor)%" end),
-        (if .enabled == false then "no" else "yes" end)
+        (if .enabled == false then "no" else "yes" end),
+        (if $k=="backend" then "explicit-only" else "yes" end)
       ] | @tsv)' | column -t -s $'\t' >&2
 }
 
@@ -264,7 +380,13 @@ cr_doctor() {
   local check
   check() {
     local a dir svc kc
-    a="$1"; dir="$(cr_account_dir "$a")"
+    a="$1"
+    if [[ "$(cr_account_kind "$a")" == "backend" ]]; then
+      if cr_backend_key "$a" >/dev/null 2>&1; then kc="ok"; else kc="MISSING (re-run: cr add-backend)"; fi
+      cr_say "  $a: backend  key=$kc  (explicit-only, not in rotation)"
+      return
+    fi
+    dir="$(cr_account_dir "$a")"
     if cr_keychain_present "$dir"; then kc="ok"; else kc="MISSING (run: cr login $a)"; fi
     svc="$(cr_keychain_service "$dir")"
     cr_say "  $a: dir=${dir:-(default ~/.claude)}  keychain[$svc]=$kc"
@@ -290,6 +412,10 @@ Launch:
 
 Manage:
   cr add <name>               create an account + browser login, cache identity
+  cr add-backend <name> …     register an alt-model endpoint (e.g. DeepSeek);
+                              flags: --base-url URL --model NAME --alias s=full
+                                     --seed-from-deep-claude
+                              (backends are explicit-only, never in rotation)
   cr register-default [name]  register your existing ~/.claude login (default)
   cr login <name>             (re)authenticate an account
   cr logout <name>            log an account out (clears its keychain item)
@@ -325,6 +451,7 @@ main() {
 
   case "${1:-}" in
     add)              shift; cr_cmd_add "$@" ;;
+    add-backend)      shift; cr_cmd_add_backend "$@" ;;
     register-default) shift; cr_cmd_register_default "$@" ;;
     login)            shift; cr_cmd_login "$@" ;;
     logout)           shift; cr_cmd_logout "$@" ;;

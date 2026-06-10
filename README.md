@@ -68,6 +68,7 @@ Manage (never forwarded to claude):
 | Command | Effect |
 |---|---|
 | `cr add <name>` | make an account dir, symlink shared settings, browser-login, cache identity |
+| `cr add-backend <name> …` | register an alt-model endpoint (e.g. DeepSeek); see Backends below |
 | `cr register-default [name]` | register the existing `~/.claude` login (no dir move) |
 | `cr login <name>` / `cr logout <name>` | (re)auth / sign out an account |
 | `cr remove <name>` | unregister (prints how to delete its dir + keychain item) |
@@ -106,6 +107,41 @@ usage left per window  (█ = available)
 
 Bars are colored green/yellow/red by headroom. `cr usage --plain` prints a
 single line per account instead.
+
+## Backends (alternate models, e.g. DeepSeek)
+
+Besides your Anthropic subscriptions, `cr` can route Claude Code to an
+Anthropic-compatible endpoint like DeepSeek. These are registered as **backend**
+accounts and behave differently from subscriptions in one deliberate way:
+
+> **Backends are explicit-only. They are never in the rotation.** A plain `cr`
+> (round-robin / lru / usage-aware) only ever picks your subscriptions. You reach
+> a backend by naming it: `cr@deepseek …` or `cr --account deepseek …`. This keeps
+> an inferior fallback model out of your normal flow until you ask for it.
+
+Register one (seeding the key from an existing `deep-claude` Keychain item):
+
+```sh
+cr add-backend deepseek --seed-from-deep-claude
+# or supply the key interactively:
+cr add-backend deepseek
+# customize endpoint / model / aliases:
+cr add-backend myllm --base-url https://host/anthropic --model some-model \
+  --alias fast=some-fast-model
+```
+
+Use it:
+
+```sh
+cr@deepseek -p "quick scratch task"      # default model
+cr@deepseek --model flash -p "…"         # alias → deepseek-v4-flash
+```
+
+A backend launch sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
+`ANTHROPIC_MODEL`, leaves `CLAUDE_CONFIG_DIR` and **`HOME` untouched** (so `gh`
+and keychain tools keep working), and stores its API key under cr's own Keychain
+item (`claude-router-backend` / `<name>`). It's effectively `deep-claude` folded
+into `cr`.
 
 ## Notes & limits
 

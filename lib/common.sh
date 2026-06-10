@@ -104,9 +104,36 @@ cr_account_exists() {
   cr_config_read | jq -e --arg n "$1" '.accounts | any(.name==$n)' >/dev/null 2>&1
 }
 
-# List enabled account names, one per line, in registry order.
+# Echo an account's kind: "subscription" (default) or "backend".
+cr_account_kind() {
+  cr_config_read | jq -r --arg n "$1" '
+    .accounts[] | select(.name==$n) | (.kind // "subscription")'
+}
+
+# List enabled *subscription* account names — the pool that rotation draws from.
+# Backends are excluded by design: they are an inferior fallback, reached only
+# by explicit `cr --account <name>` / `cr@<name>`.
 cr_enabled_accounts() {
-  cr_config_read | jq -r '.accounts[] | select(.enabled != false) | .name'
+  cr_config_read | jq -r '.accounts[]
+    | select(.enabled != false)
+    | select((.kind // "subscription") == "subscription")
+    | .name'
+}
+
+# Keychain service under which cr stores its own backend API keys.
+CR_BACKEND_KEYCHAIN_SVC="claude-router-backend"
+
+# Read a backend account's API key from cr's keychain item (macOS) or, as a
+# fallback, from a plaintext key cached in the registry. Echoes the key.
+cr_backend_key() {
+  local name="$1" key
+  if cr_have security; then
+    key="$(security find-generic-password -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" -w 2>/dev/null)" || key=""
+    [[ -n "$key" ]] && { printf '%s' "$key"; return 0; }
+  fi
+  key="$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.apiKey // empty')"
+  [[ -n "$key" ]] && { printf '%s' "$key"; return 0; }
+  return 1
 }
 
 # --- Keychain service name (mirrors Claude Code's own derivation) ---------
