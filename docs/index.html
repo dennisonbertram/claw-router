@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Claw Router — one command, all your Claude accounts</title>
+<meta name="description" content="A tiny wrapper around Claude Code that spreads your sessions across all your Claude subscriptions — round-robin, least-recently-used, or wherever the headroom is — so no single plan burns out first.">
+<meta name="theme-color" content="#f2eee2">
+<link rel="canonical" href="https://dennisonbertram.github.io/claw-router/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Claw Router — one command, all your Claude accounts">
+<meta property="og:description" content="Effortlessly manage your Claude subscriptions. One command. All your accounts. Used evenly, so they last.">
+<meta property="og:image" content="https://dennisonbertram.github.io/claw-router/assets/banner.png">
+<meta property="og:url" content="https://dennisonbertram.github.io/claw-router/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🦞%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the story</a>
+
+<header class="nav-edge">
+  <a class="wordmark" href="#top">Claw Router</a>
+  <a class="link" href="https://github.com/dennisonbertram/claw-router">GitHub&nbsp;↗</a>
+</header>
+
+<section class="hero" id="top">
+  <div class="hero__inner">
+    <h1 class="reveal" style="--i:0">One command. <em>All</em> your Claude accounts.</h1>
+    <p class="hero__lede reveal" style="--i:1"><code>cr</code> is a tiny wrapper around Claude&nbsp;Code. Each launch, it picks one of your Claude subscriptions, says which, and gets out of the way — spreading the load so no single plan burns out first.</p>
+    <p class="hero__actions reveal" style="--i:2">
+      <a class="link" href="#stage-setup">Jump to install&nbsp;↓</a>
+      <a class="link" href="https://github.com/dennisonbertram/claw-router">View on GitHub&nbsp;↗</a>
+    </p>
+  </div>
+
+  <figure class="braid">
+    <svg viewBox="0 0 1440 260" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Six wavering streams — four terracotta, two slate — braid together and leave as evenly spaced parallel lines.">
+      <!-- strand C — light terracotta -->
+      <path class="strand strand--casing strand--draw" style="--i:0" pathLength="1" d="M -20 200 C 160 200 250 170 360 176 C 480 182 550 200 650 174 C 750 148 800 100 880 106 C 945 111 975 118 1010 118 H 1460"/>
+      <path class="strand strand--draw" style="--i:0; stroke: var(--stream-2)" pathLength="1" d="M -20 200 C 160 200 250 170 360 176 C 480 182 550 200 650 174 C 750 148 800 100 880 106 C 945 111 975 118 1010 118 H 1460"/>
+      <!-- strand A — terracotta -->
+      <path class="strand strand--casing strand--draw" style="--i:1" pathLength="1" d="M -20 120 C 140 120 220 90 340 100 C 460 110 520 150 620 130 C 720 110 760 60 860 58 C 930 57 960 70 1010 70 H 1460"/>
+      <path class="strand strand--draw" style="--i:1; stroke: var(--stream-1)" pathLength="1" d="M -20 120 C 140 120 220 90 340 100 C 460 110 520 150 620 130 C 720 110 760 60 860 58 C 930 57 960 70 1010 70 H 1460"/>
+      <!-- strand E — sand -->
+      <path class="strand strand--casing strand--draw" style="--i:2" pathLength="1" d="M -20 235 C 150 235 260 215 370 210 C 480 205 560 170 660 180 C 740 188 820 160 890 162 C 945 163 975 166 1010 166 H 1460"/>
+      <path class="strand strand--draw" style="--i:2; stroke: var(--stream-4)" pathLength="1" d="M -20 235 C 150 235 260 215 370 210 C 480 205 560 170 660 180 C 740 188 820 160 890 162 C 945 163 975 166 1010 166 H 1460"/>
+      <!-- strand B — slate -->
+      <path class="strand strand--casing strand--draw" style="--i:3" pathLength="1" d="M -20 30 C 150 30 240 60 350 54 C 470 48 540 20 640 40 C 740 60 800 110 880 104 C 940 99 970 94 1010 94 H 1460"/>
+      <path class="strand strand--draw" style="--i:3; stroke: var(--stream-5)" pathLength="1" d="M -20 30 C 150 30 240 60 350 54 C 470 48 540 20 640 40 C 740 60 800 110 880 104 C 940 99 970 94 1010 94 H 1460"/>
+      <!-- strand F — light slate -->
+      <path class="strand strand--casing strand--draw" style="--i:4" pathLength="1" d="M -20 160 C 140 160 240 185 350 190 C 470 195 560 220 660 208 C 760 196 830 196 900 192 C 950 189 980 190 1010 190 H 1460"/>
+      <path class="strand strand--draw" style="--i:4; stroke: var(--stream-6)" pathLength="1" d="M -20 160 C 140 160 240 185 350 190 C 470 195 560 220 660 208 C 760 196 830 196 900 192 C 950 189 980 190 1010 190 H 1460"/>
+      <!-- strand D — deep terracotta -->
+      <path class="strand strand--casing strand--draw" style="--i:5" pathLength="1" d="M -20 70 C 150 70 230 110 350 104 C 470 98 530 60 630 80 C 730 100 790 150 870 148 C 935 146 970 142 1010 142 H 1460"/>
+      <path class="strand strand--draw" style="--i:5; stroke: var(--stream-3)" pathLength="1" d="M -20 70 C 150 70 230 110 350 104 C 470 98 530 60 630 80 C 730 100 790 150 870 148 C 935 146 970 142 1010 142 H 1460"/>
+    </svg>
+    <figcaption class="reveal" style="--i:3">Many accounts in. One even flow out.</figcaption>
+  </figure>
+</section>
+
+<main id="main">
+  <ol class="stages">
+
+    <li class="stage" id="stage-wall">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">1.0</span>The wall.</h2>
+      <div class="prose">
+        <p>It’s 4&nbsp;p.m., the refactor is half-landed, and Claude&nbsp;Code stops mid-thought: the 5-hour window just closed. So you type <code>/login</code>, squint at the account picker, swap to the other subscription, and try to remember where you were.</p>
+        <p>If you keep two or three Claude&nbsp;Max plans around precisely for this moment, you know the ritual. The plans aren’t the problem — the swapping is. Routing is a job for software, not for muscle memory.</p>
+      </div>
+    </li>
+
+    <li class="stage" id="stage-trick">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">2.0</span>The trick.</h2>
+      <div class="prose">
+        <p>Claude&nbsp;Code keys its credentials off a single environment variable. Each distinct <code>CLAUDE_CONFIG_DIR</code> gets its own isolated macOS Keychain login — so <code>cr</code> keeps one directory per account, and on every launch it:</p>
+        <ol>
+          <li>picks an account by policy — or your forced <code>--account</code>,</li>
+          <li>unsets <code>ANTHROPIC_API_KEY</code> and friends, which would otherwise override your subscription login,</li>
+          <li>points <code>CLAUDE_CONFIG_DIR</code> at the chosen account,</li>
+          <li>prints a one-line banner to <strong>stderr</strong>, and</li>
+          <li><code>exec</code>s the real <code>claude</code> — TTY, signals, and exit code pass straight through, with zero overhead.</li>
+        </ol>
+      </div>
+      <aside class="aside-note">
+        <p class="aside-note__head">Your secrets never move.</p>
+        <p><code>cr</code> never reads, copies, or stores credentials. Claude&nbsp;Code reads its own Keychain login and refreshes its own token — <code>cr</code> only decides <em>which</em> login it reads.</p>
+      </aside>
+    </li>
+
+    <li class="stage" id="stage-setup">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">3.0</span>The setup.</h2>
+      <div class="prose">
+        <p>Three lines to install, one browser login per account. macOS-first, because Keychain isolation is the clean path there; it runs on Linux too, where credentials come from <code>.credentials.json</code> instead. The only hard dependency is <code>jq</code>.</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">sh</span>
+          <button class="copy-btn" type="button" data-copy="install-sh" aria-live="polite">Copy</button>
+        </div>
+        <pre id="install-sh"><code>git clone https://github.com/dennisonbertram/claw-router.git
+cd claw-router
+./install.sh   <span class="c"># symlinks `cr` into ~/.local/bin</span></code></pre>
+      </div>
+      <div class="prose">
+        <p>Then teach it your accounts. Your existing <code>~/.claude</code> login is adopted as <code>default</code> — never moved, never modified.</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">sh</span>
+          <button class="copy-btn" type="button" data-copy="accounts-sh" aria-live="polite">Copy</button>
+        </div>
+        <pre id="accounts-sh"><code>cr register-default   <span class="c"># adopt your current ~/.claude login</span>
+cr add work           <span class="c"># create + browser-login a second account</span>
+cr add personal       <span class="c"># …and a third</span>
+cr list               <span class="c"># see them all</span></code></pre>
+      </div>
+    </li>
+
+    <li class="stage" id="stage-flow">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">4.0</span>The flow.</h2>
+      <div class="prose">
+        <p>From here on, type <code>cr</code> wherever you typed <code>claude</code>. Anything it doesn’t recognize is forwarded verbatim — flags, prompts, <code>--resume</code>, all of it. The only visible difference is one quiet line saying who’s at the helm.</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">console</span>
+        </div>
+        <pre><code>$ cr -p "explain this repo"
+<span class="a">◆ work</span>  you@work.com  (claude_max) · round-robin
+<span class="o">…claude runs normally…</span>
+
+$ cr -p "and the tests?"
+<span class="s">◆ personal</span>  you@gmail.com  (claude_max) · round-robin
+<span class="o">…next call, next account…</span></code></pre>
+      </div>
+      <div class="prose">
+        <p>Four ways to pick the next account:</p>
+      </div>
+      <dl class="policies">
+        <dt>round-robin<span class="default-tag">— the default</span></dt>
+        <dd>An even spread across every enabled account.</dd>
+        <dt>lru</dt>
+        <dd>Whichever account has rested longest.</dd>
+        <dt>random</dt>
+        <dd>Uniform random.</dd>
+        <dt>usage-aware</dt>
+        <dd>Whichever account has the most headroom right now, by the numbers from <code>cr usage</code>.</dd>
+      </dl>
+      <div class="prose">
+        <p style="margin-top: var(--space-lg)">Pin one with <code>cr use work</code> when you want stillness; force a single launch with <code>cr@work</code> when you don’t.</p>
+      </div>
+    </li>
+
+    <li class="stage" id="stage-balance">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">5.0</span>The balance.</h2>
+      <div class="prose">
+        <p><code>cr usage</code> draws how much is left in each window — the 5-hour session, the 7-day total — with reset countdowns, so you can see at a glance which subscription to lean on.</p>
+      </div>
+      <figure class="meters">
+        <figcaption>usage left per window — from the README’s own example</figcaption>
+        <div class="meter-account">
+          <p class="meter-account__name">default <span class="email">you@work.com</span></p>
+          <div class="meter-row">
+            <span class="label">5h session</span>
+            <span class="meter-bar"><i style="width:42%"></i></span>
+            <span class="pct">42% left</span>
+            <span class="reset">resets in 1h17m</span>
+          </div>
+          <div class="meter-row">
+            <span class="label">7d total</span>
+            <span class="meter-bar"><i style="width:88%"></i></span>
+            <span class="pct">88% left</span>
+            <span class="reset">resets in 2d13h</span>
+          </div>
+        </div>
+        <div class="meter-account meter-account--alt">
+          <p class="meter-account__name">personal <span class="email">you@gmail.com</span></p>
+          <div class="meter-row">
+            <span class="label">5h session</span>
+            <span class="meter-bar"><i style="width:100%"></i></span>
+            <span class="pct">100% left</span>
+            <span class="reset">resets in 4h47m</span>
+          </div>
+          <div class="meter-row">
+            <span class="label">7d total</span>
+            <span class="meter-bar"><i style="width:100%"></i></span>
+            <span class="pct">100% left</span>
+            <span class="reset">resets in 4d22h</span>
+          </div>
+        </div>
+      </figure>
+      <div class="prose">
+        <p>And every policy <strong>skips exhausted accounts</strong>. Before routing, <code>cr</code> refreshes stale usage data and drops any account at or above the exhaustion threshold from the rotation — a maxed-out subscription is never chosen. If <em>every</em> account is spent, it falls back to the full set rather than failing. Tune it to taste:</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">sh</span>
+        </div>
+        <pre><code>cr config exhausted-at 90   <span class="c"># treat ≥90% used as "out", leave headroom</span>
+cr config auto-refresh off  <span class="c"># don't auto-poll before routing</span>
+cr config ttl 600           <span class="c"># cached usage goes stale after 10 min</span></code></pre>
+      </div>
+    </li>
+  </ol>
+
+  <section class="reference" id="reference">
+    <div class="reference__inner">
+      <h2 class="section-head">The reference.</h2>
+      <p class="section-sub">The complete surface. Anything <code>cr</code> doesn’t recognize belongs to <code>claude</code>.</p>
+
+      <table class="spec-sheet">
+        <thead><tr><th colspan="2">Launch</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">cr [args…]</th><td>Route by policy, then run <code>claude</code> with your args.</td></tr>
+          <tr><th scope="row">cr@&lt;name&gt; [args…]</th><td>Force an account — shorthand for <code>--account &lt;name&gt;</code>.</td></tr>
+          <tr><th scope="row">cr --sandbox · -s</th><td>Run the session inside a <code>cco</code> container.</td></tr>
+          <tr><th scope="row">cr … -- [args…]</th><td><code>--</code> ends <code>cr</code>’s flags; everything after belongs to <code>claude</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <table class="spec-sheet">
+        <thead><tr><th colspan="2">Manage</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">cr add &lt;name&gt;</th><td>New account: directory, shared settings, browser login.</td></tr>
+          <tr><th scope="row">cr register-default</th><td>Adopt your existing <code>~/.claude</code> login in place.</td></tr>
+          <tr><th scope="row">cr list</th><td>Every account: email, plan, last used, usage, enabled.</td></tr>
+          <tr><th scope="row">cr use &lt;name&gt; · unuse</th><td>Pin the rotation to one account, or release it.</td></tr>
+          <tr><th scope="row">cr policy &lt;p&gt;</th><td><code>round-robin</code> · <code>lru</code> · <code>random</code> · <code>usage-aware</code>.</td></tr>
+          <tr><th scope="row">cr usage [name]</th><td>Per-window meters with reset countdowns.</td></tr>
+          <tr><th scope="row">cr status [--refresh]</th><td>Dashboard: next pick, plus per-account usage bars.</td></tr>
+          <tr><th scope="row">cr doctor [name]</th><td>Verify each account’s directory and Keychain credential.</td></tr>
+          <tr><th scope="row">cr add-backend &lt;name&gt;</th><td>Register an alt-model endpoint, e.g. DeepSeek.</td></tr>
+          <tr><th scope="row">cr adopt &lt;id&gt; &lt;account&gt;</th><td>Link a session into another account ahead of time.</td></tr>
+          <tr><th scope="row">cr login · logout · remove</th><td>Re-auth, sign out, or unregister an account.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="aboard" id="aboard">
+    <div class="aboard__inner">
+      <h2 class="section-head">Also aboard.</h2>
+      <p class="section-sub">Three more things the router carries, for the days you need them.</p>
+
+      <div class="aboard-row">
+        <h3>Backends, explicit-only.<small>cr add-backend deepseek</small></h3>
+        <div>
+          <p><code>cr</code> can point Claude&nbsp;Code at any Anthropic-compatible endpoint — DeepSeek, say — registered as a <em>backend</em> account. Backends are never in the rotation: a plain <code>cr</code> only ever picks your subscriptions. You reach one by naming it — <code>cr@deepseek</code> — so an inferior fallback model stays out of your flow until you ask for it.</p>
+        </div>
+      </div>
+
+      <div class="aboard-row">
+        <h3>A sandbox, one flag away.<small>cr --sandbox · -s</small></h3>
+        <div>
+          <p><code>--sandbox</code> runs the session inside a container via <a href="https://github.com/nikvdp/cco">cco</a>, so Claude&nbsp;Code can’t touch anything outside your project. <code>cr</code> still does the routing — policies, pins, backends, and <code>--resume</code> all compose unchanged.</p>
+        </div>
+      </div>
+
+      <div class="aboard-row">
+        <h3>Sessions that follow you.<small>cr --resume &lt;id&gt;</small></h3>
+        <div>
+          <p>Claude&nbsp;Code stores each conversation under the account that created it. <code>cr --resume</code> just works: whichever account the rotation picks, <code>cr</code> transparently links the session in from the account that owns it. You never see “No conversation found” again.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cta-close" id="install">
+    <div class="cta-close__inner">
+      <h2 class="section-head">Stop watching the meter.</h2>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">sh</span>
+          <button class="copy-btn" type="button" data-copy="cta-sh" aria-live="polite">Copy</button>
+        </div>
+        <pre id="cta-sh"><code>git clone https://github.com/dennisonbertram/claw-router.git &amp;&amp; cd claw-router &amp;&amp; ./install.sh</code></pre>
+      </div>
+      <p class="cta-close__links">
+        <a class="link" href="https://github.com/dennisonbertram/claw-router">View on GitHub&nbsp;↗</a>
+        <a class="link" href="https://github.com/dennisonbertram/claw-router#readme">Read the README&nbsp;↗</a>
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer class="foot-letter">
+  <div class="foot-letter__inner">
+    <hr class="foot-letter__rule">
+    <p class="foot-letter__close">Routed with care,<br><span class="foot-letter__sign">— Dennison</span></p>
+    <p class="foot-letter__ps">P.S. — Open source under <a href="https://github.com/dennisonbertram/claw-router/blob/main/LICENSE">MIT</a>. Not affiliated with Anthropic — “Claude” and “Claude&nbsp;Code” are trademarks of Anthropic. Letters back are welcome <a href="https://github.com/dennisonbertram/claw-router/issues">in the issues</a>.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  document.documentElement.classList.add("js");
+
+  /* one-shot stage rule sweep — desktop, motion-permitting */
+  var stages = document.querySelectorAll(".stage");
+  var wantsMotion = window.matchMedia("(prefers-reduced-motion: no-preference)").matches;
+  var wideEnough = window.matchMedia("(min-width: 40rem)").matches;
+  if (wantsMotion && wideEnough && "IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          e.target.classList.add("is-seen");
+          io.unobserve(e.target);
+        }
+      });
+    }, { rootMargin: "0px 0px -12% 0px" });
+    stages.forEach(function (s) { io.observe(s); });
+  } else {
+    stages.forEach(function (s) { s.classList.add("is-seen"); });
+  }
+
+  /* copy-to-clipboard — label swap is the feedback, no toast */
+  document.querySelectorAll(".copy-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var src = document.getElementById(btn.dataset.copy);
+      if (!src) return;
+      var text = src.innerText.replace(/^\$\s/gm, "");
+      navigator.clipboard.writeText(text).then(function () {
+        btn.dataset.state = "copied";
+        btn.textContent = "Copied ✓";
+        setTimeout(function () {
+          delete btn.dataset.state;
+          btn.textContent = "Copy";
+        }, 2500);
+      }).catch(function () {
+        btn.dataset.state = "error";
+        btn.textContent = "Select & copy";
+        setTimeout(function () {
+          delete btn.dataset.state;
+          btn.textContent = "Copy";
+        }, 3000);
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>

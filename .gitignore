@@ -1,3 +1,4 @@
 crhome/
 *.log
 .DS_Store
+.hallmark/
