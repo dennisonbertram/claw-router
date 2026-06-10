@@ -130,6 +130,19 @@ Manage (never forwarded to claude):
   numbers from `cr usage`. Run `cr usage` periodically (or wire it to a cron) to
   refresh the cached figures; falls back to `lru` if usage data is unavailable.
 
+**All policies skip exhausted accounts.** Before routing, `cr` refreshes usage
+when the cache is stale and drops any account at/above the exhaustion threshold
+(default 100%) from the rotation — so a maxed-out subscription is never chosen.
+If *every* account is exhausted, it falls back to the full set rather than
+failing. An account with no usage data yet counts as available. Tune it:
+
+```sh
+cr config                       # show routing knobs
+cr config exhausted-at 90       # treat ≥90% used as "out", leave headroom
+cr config auto-refresh off      # don't auto-poll before routing (use cr usage)
+cr config ttl 600               # consider cached usage stale after 10 min
+```
+
 Tip: `cr usage` draws a meter of how much is left in each window (5-hour session,
 7-day total, and per-model 7-day) with reset countdowns, so you can see at a
 glance which subscription to lean on:

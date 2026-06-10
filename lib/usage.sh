@@ -235,6 +235,29 @@ cr_age_human() {
   else printf '%dd' $(( (d+43200)/86400 )); fi
 }
 
+# Refresh cached usage for all enabled accounts IF the cache is stale, so the
+# "skip exhausted accounts" routing has fresh numbers. Best-effort and bounded:
+# - Skips entirely without curl, or when disabled via .autoRefreshUsage=false.
+# - TTL from .usageTtlSeconds (default 900s = 15m).
+# - Polls accounts whose snapshot is older than the TTL (or missing).
+# This adds a little latency to a launch only when the cache has gone stale.
+cr_refresh_usage_if_stale() {
+  [[ -n "${CR_NO_AUTO_REFRESH:-}" ]] && return 0   # test/escape hatch
+  cr_have curl || return 0
+  [[ "$(cr_config_read | jq -r '.autoRefreshUsage // true')" == "false" ]] && return 0
+  local ttl now_s; ttl="$(cr_config_read | jq -r '.usageTtlSeconds // 900')"
+  now_s="$(date +%s)"
+  local stale; stale="$(cr_config_read | jq -r --argjson now "$now_s" --argjson ttl "$ttl" '
+    .accounts[]
+    | select(.enabled != false) | select((.kind // "subscription") == "subscription")
+    | select(((.usage.checkedAt // 0) / 1000) < ($now - $ttl))
+    | .name')"
+  [[ -z "$stale" ]] && return 0
+  local a; while IFS= read -r a; do
+    [[ -n "$a" ]] && cr_poll_account "$a" >/dev/null 2>&1 || true
+  done <<< "$stale"
+}
+
 # Poll one account and cache its usagePct + a short summary into the registry.
 # Echoes a human summary line. Best-effort.
 cr_poll_account() {

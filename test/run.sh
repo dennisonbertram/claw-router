@@ -4,14 +4,17 @@
 set -uo pipefail
 
 CR_REPO="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PASS=0; FAIL=0
-ok()   { printf '  ok   %s\n' "$1"; PASS=$((PASS+1)); }
-bad()  { printf '  FAIL %s\n' "$1"; printf '       %s\n' "${2:-}"; FAIL=$((FAIL+1)); }
-eq()   { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "expected [$3] got [$2]"; fi; }
-
 # Isolated sandbox per run.
 SBX="$(mktemp -d)"
 trap 'rm -rf "$SBX"' EXIT
+# Tests use fake accounts; never let a launch poll the real usage endpoint
+# (the null-configDir "default" account would otherwise hit the real keychain).
+export CR_NO_AUTO_REFRESH=1
+# Tally via files so counts survive subshells (many test blocks run in ( … )).
+: > "$SBX/.pass"; : > "$SBX/.fail"
+ok()   { printf '  ok   %s\n' "$1"; printf x >> "$SBX/.pass"; }
+bad()  { printf '  FAIL %s\n' "$1"; printf '       %s\n' "${2:-}"; printf x >> "$SBX/.fail"; }
+eq()   { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "expected [$3] got [$2]"; fi; }
 export CR_HOME="$SBX/crhome"
 
 # Fake claude on PATH: records env+args, exits with $FAKE_EXIT (default 0).
@@ -289,6 +292,92 @@ FAKE_EXIT=0 "$CR" --sandbox --account work -p hi >"$SBX/stdout" 2>"$SBX/stderr";
 eq "missing cco exits nonzero" "$([[ $rc -ne 0 ]] && echo nonzero || echo zero)" "nonzero"
 if grep -q 'cco' "$SBX/stderr"; then ok "missing cco explains how to install"; else bad "missing cco hint" "$(cat "$SBX/stderr")"; fi
 
+echo "== availability: round-robin/lru skip exhausted accounts =="
+( export CR_HOME="$SBX/avail"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"a","kind":"subscription","configDir":null,"lastUsed":1,"enabled":true,"usagePct":100},
+  {"name":"b","kind":"subscription","configDir":"/b","lastUsed":9,"enabled":true,"usagePct":20},
+  {"name":"c","kind":"subscription","configDir":"/c","lastUsed":5,"enabled":true,"usagePct":100}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  pool="$(cr_available_accounts | tr '\n' ',')"
+  eq "available pool excludes 100%-used a and c" "$pool" "b,"
+  # round-robin should only ever return b (a and c are exhausted)
+  r="$(cr_select_round_robin)$(cr_select_round_robin)$(cr_select_round_robin)"
+  eq "round-robin sticks to the only available account" "$r" "bbb"
+  # lru must also skip exhausted, even though 'a' has the smallest lastUsed
+  eq "lru picks available 'b', not lower-lastUsed exhausted 'a'" "$(cr_select_lru)" "b"
+)
+
+echo "== availability: all exhausted → fall back to all enabled (don't hard-fail) =="
+( export CR_HOME="$SBX/avail2"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"a","kind":"subscription","configDir":null,"lastUsed":1,"enabled":true,"usagePct":100},
+  {"name":"b","kind":"subscription","configDir":"/b","lastUsed":9,"enabled":true,"usagePct":100}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  got="$(cr_select_round_robin)"
+  if [[ "$got" == "a" || "$got" == "b" ]]; then ok "all-exhausted falls back to an enabled account"; else bad "all-exhausted fallback" "got [$got]"; fi
+)
+
+echo "== availability: unknown usage is treated as available =="
+( export CR_HOME="$SBX/avail3"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"a","kind":"subscription","configDir":null,"lastUsed":1,"enabled":true,"usagePct":100},
+  {"name":"b","kind":"subscription","configDir":"/b","lastUsed":9,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  eq "account with no usage data counts as available" "$(cr_available_accounts | tr '\n' ',')" "b,"
+)
+
+echo "== owner detection: a symlinked copy is NOT ownership =="
+( export CR_HOME="$SBX/own"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/real/projects/-p" "$CR_HOME/accounts/linked/projects/-p"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"real","kind":"subscription","configDir":"$CR_HOME/accounts/real","lastUsed":0,"enabled":true},
+  {"name":"linked","kind":"subscription","configDir":"$CR_HOME/accounts/linked","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # cr_account_owning_session lives in cr (not lib); pull it in.
+  eval "$(sed -n '/^cr_account_owning_session()/,/^}/p' "$CR_REPO/cr")"
+  SID="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+  echo '{"real":1}' > "$CR_HOME/accounts/real/projects/-p/$SID.jsonl"
+  ln -s "$CR_HOME/accounts/real/projects/-p/$SID.jsonl" "$CR_HOME/accounts/linked/projects/-p/$SID.jsonl"
+  eq "owner is the real-file account, not the symlinked one" "$(cr_account_owning_session "$SID")" "real"
+)
+
+echo "== link safety: never destroy a real transcript at the target =="
+( export CR_HOME="$SBX/safe"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/x/projects/-p" "$CR_HOME/accounts/y/projects/-p"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"x","kind":"subscription","configDir":"$CR_HOME/accounts/x","lastUsed":0,"enabled":true},
+  {"name":"y","kind":"subscription","configDir":"$CR_HOME/accounts/y","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  SID="cccccccc-dddd-eeee-ffff-000000000000"
+  echo '{"src":1}' > "$CR_HOME/accounts/x/projects/-p/$SID.jsonl"
+  echo '{"DEST_REAL":1}' > "$CR_HOME/accounts/y/projects/-p/$SID.jsonl"   # y has its OWN real file
+)
+# cr_link_session is in cr (not lib); exercise the safety rule via the launcher path indirectly:
+# Re-run owner detection + a manual link attempt by sourcing cr's function set.
+( export CR_HOME="$SBX/safe"; source "$CR_REPO/lib/common.sh"
+  # inline-source just the function under test from cr without running main:
+  eval "$(sed -n '/^cr_link_session()/,/^}/p' "$CR_REPO/cr")"
+  SID="cccccccc-dddd-eeee-ffff-000000000000"
+  cr_link_session "$SID" y >/dev/null 2>&1 || true
+  dest="$CR_HOME/accounts/y/projects/-p/$SID.jsonl"
+  if [[ -f "$dest" && ! -L "$dest" ]] && grep -q DEST_REAL "$dest"; then ok "real target transcript left intact (not clobbered)"; else bad "link safety" "target was destroyed or replaced: $(ls -l "$dest" 2>&1)"; fi
+)
+
 echo
+PASS=$(wc -c < "$SBX/.pass" | tr -d ' '); FAIL=$(wc -c < "$SBX/.fail" | tr -d ' ')
 echo "== $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

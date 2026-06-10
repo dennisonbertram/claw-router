@@ -191,35 +191,68 @@ cr_keychain_present() {
 # These read the registry and return an account name on stdout. They are the
 # unit-tested core of the router.
 
-# round-robin: advance cursor over enabled accounts, persist, return chosen.
+# An account counts as "exhausted" when its cached usagePct is at/above this
+# threshold. Override per-config with .exhaustedAtPct. Accounts with NO cached
+# usage are treated as available (unknown ≠ exhausted).
+cr_exhausted_threshold() {
+  cr_config_read | jq -r '.exhaustedAtPct // 100'
+}
+
+# Enabled subscription accounts that are NOT out of usage (per cached usagePct).
+# This is the pool round-robin / lru / random actually draw from. If EVERY
+# account is exhausted, this prints nothing — callers fall back to all enabled
+# rather than hard-failing.
+cr_available_accounts() {
+  local thr; thr="$(cr_exhausted_threshold)"
+  cr_config_read | jq -r --argjson t "$thr" '
+    .accounts[]
+    | select(.enabled != false)
+    | select((.kind // "subscription") == "subscription")
+    | select((.usagePct == null) or (.usagePct < $t))
+    | .name'
+}
+
+# Echo the available pool, or fall back to all enabled if none are available.
+# Also sets CR_POOL_FELL_BACK=1 when it had to fall back (all exhausted).
+cr_selection_pool() {
+  CR_POOL_FELL_BACK=0
+  local out; out="$(cr_available_accounts)"
+  if [[ -z "$out" ]]; then CR_POOL_FELL_BACK=1; cr_enabled_accounts; else printf '%s\n' "$out"; fi
+}
+
+# round-robin: advance cursor over the available pool, persist, return chosen.
 cr_select_round_robin() {
-  local -a enabled
-  while IFS= read -r line; do enabled+=("$line"); done < <(cr_enabled_accounts)
-  local n=${#enabled[@]}
+  local -a pool
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  local n=${#pool[@]}
   ((n == 0)) && return 1
   local cursor
   cursor="$(cr_config_read | jq -r '.rotation.cursor // 0')"
   local idx=$(( cursor % n ))
   local next=$(( (idx + 1) % n ))
   cr_config_update '.rotation.cursor = ($c|tonumber)' --arg c "$next" >/dev/null
-  printf '%s' "${enabled[$idx]}"
+  printf '%s' "${pool[$idx]}"
 }
 
-# lru: enabled account with smallest lastUsed (ties -> registry order).
+# lru: account in the available pool with the smallest lastUsed.
 cr_select_lru() {
-  cr_config_read | jq -r '
-    [.accounts[] | select(.enabled != false)]
-    | sort_by(.lastUsed // 0)
-    | .[0].name // empty'
+  local -a pool
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  ((${#pool[@]} == 0)) && return 1
+  # Build a jq filter restricting to the pool, then pick min lastUsed.
+  local names_json; names_json="$(printf '%s\n' "${pool[@]}" | jq -R . | jq -cs .)"
+  cr_config_read | jq -r --argjson pool "$names_json" '
+    [.accounts[] | select(.name as $n | $pool | index($n))]
+    | sort_by(.lastUsed // 0) | .[0].name // empty'
 }
 
-# random: a uniformly random enabled account.
+# random: a uniformly random account from the available pool.
 cr_select_random() {
-  local -a enabled
-  while IFS= read -r line; do enabled+=("$line"); done < <(cr_enabled_accounts)
-  local n=${#enabled[@]}
+  local -a pool
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  local n=${#pool[@]}
   ((n == 0)) && return 1
-  printf '%s' "${enabled[$(( RANDOM % n ))]}"
+  printf '%s' "${pool[$(( RANDOM % n ))]}"
 }
 
 # usage-aware: pick enabled account with most remaining headroom from the

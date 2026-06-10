@@ -84,18 +84,21 @@ cr_args_resume_kind() {
   return 1
 }
 
-# Given a session id, echo the name of the account whose config dir contains
-# its transcript (projects/*/<id>.jsonl). Empty if none / not found.
+# Given a session id, echo the name of the account that OWNS its transcript —
+# i.e. holds the real file, not a symlink. A symlinked copy (from a prior
+# auto-link) is explicitly NOT ownership, so we never chase our own links.
+# Empty if no account holds a real transcript.
 cr_account_owning_session() {
-  local sid="$1" name dir base
+  local sid="$1" name dir base f
   [[ -z "$sid" ]] && return 1
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
     dir="$(cr_account_dir "$name" 2>/dev/null || true)"
     base="${dir:-$HOME/.claude}"
-    if compgen -G "${base}/projects/*/${sid}.jsonl" >/dev/null 2>&1; then
-      printf '%s' "$name"; return 0
-    fi
+    for f in "${base}"/projects/*/"${sid}".jsonl; do
+      # Real file only: exists, is a regular file, and is NOT a symlink.
+      if [[ -f "$f" && ! -L "$f" ]]; then printf '%s' "$name"; return 0; fi
+    done
   done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription")|.name')
   return 1
 }
@@ -118,6 +121,9 @@ cr_launch() {
       [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
       cr_die "no accounts registered. Run: cr add <name>"
     fi
+    # Keep usage fresh enough that "skip exhausted accounts" actually works.
+    # Refreshes in the background only when the cache is stale (best-effort).
+    [[ "$n" -gt 1 ]] && cr_refresh_usage_if_stale
     if [[ "$n" -eq 1 ]]; then
       account="$(cr_enabled_accounts | head -1)"
     else
@@ -385,6 +391,36 @@ cr_cmd_policy() {
   esac
 }
 
+# Tune routing knobs:  cr config [exhausted-at <pct> | auto-refresh on|off | ttl <sec>]
+cr_cmd_config() {
+  cr_ensure_home
+  local key="${1:-}" val="${2:-}"
+  case "$key" in
+    "" )
+      local c; c="$(cr_config_read)"
+      cr_say "routing config:"
+      cr_say "  exhausted-at  $(printf '%s' "$c" | jq -r '.exhaustedAtPct // 100')%   (skip accounts at/above this usage)"
+      cr_say "  auto-refresh  $(printf '%s' "$c" | jq -r 'if (.autoRefreshUsage // true) then "on" else "off" end')   (poll usage before routing when stale)"
+      cr_say "  ttl           $(printf '%s' "$c" | jq -r '.usageTtlSeconds // 900')s   (how long cached usage stays fresh)"
+      ;;
+    exhausted-at)
+      [[ "$val" =~ ^[0-9]+$ ]] || cr_die "usage: cr config exhausted-at <0-100>"
+      cr_config_update '.exhaustedAtPct = ($v|tonumber)' --arg v "$val"
+      cr_say "Accounts at/above ${val}% usage will be skipped by rotation." ;;
+    auto-refresh)
+      case "$val" in
+        on|true)  cr_config_update '.autoRefreshUsage = true';  cr_say "Auto-refresh on." ;;
+        off|false) cr_config_update '.autoRefreshUsage = false'; cr_say "Auto-refresh off (run 'cr usage' to update manually)." ;;
+        *) cr_die "usage: cr config auto-refresh on|off" ;;
+      esac ;;
+    ttl)
+      [[ "$val" =~ ^[0-9]+$ ]] || cr_die "usage: cr config ttl <seconds>"
+      cr_config_update '.usageTtlSeconds = ($v|tonumber)' --arg v "$val"
+      cr_say "Usage cache TTL set to ${val}s." ;;
+    *) cr_die "unknown config key '$key' (exhausted-at | auto-refresh | ttl)" ;;
+  esac
+}
+
 cr_cmd_list() {
   cr_ensure_home
   local rows; rows="$(cr_config_read)"
@@ -458,22 +494,37 @@ cr_link_session() {
   src_base="$(cr_account_dir "$owner" 2>/dev/null || true)"; src_base="${src_base:-$HOME/.claude}"
   tgt_base="$(cr_account_dir "$target" 2>/dev/null || true)"; tgt_base="${tgt_base:-$HOME/.claude}"
 
-  local src_file proj
-  src_file="$(compgen -G "${src_base}/projects/*/${sid}.jsonl" 2>/dev/null | head -1)"
-  [[ -z "$src_file" ]] && return 1
+  # Find the owner's REAL transcript (owner detection guarantees it's a real
+  # file, but re-check before we ever touch the filesystem).
+  local src_file proj f
+  for f in "${src_base}"/projects/*/"${sid}".jsonl; do
+    [[ -f "$f" && ! -L "$f" ]] && { src_file="$f"; break; }
+  done
+  [[ -z "${src_file:-}" ]] && return 1
   proj="$(basename "$(dirname "$src_file")")"
 
   local tgt_dir="${tgt_base}/projects/${proj}"
-  mkdir -p "$tgt_dir"
   local tgt_file="${tgt_dir}/${sid}.jsonl"
-  [[ -e "$tgt_file" || -L "$tgt_file" ]] && rm -f "$tgt_file"
+
+  # SAFETY: never destroy a real transcript at the target. Only replace a stale
+  # symlink. If a real file is already there, leave it — the target owns its own.
+  if [[ -f "$tgt_file" && ! -L "$tgt_file" ]]; then
+    CR_LINK_OWNER="$owner"; return 0   # target already has a real copy; nothing to do
+  fi
+  # Don't link a file onto itself (same inode / resolves to the same path).
+  if [[ "$src_file" -ef "$tgt_file" ]]; then CR_LINK_OWNER="$owner"; return 0; fi
+
+  mkdir -p "$tgt_dir"
+  [[ -L "$tgt_file" ]] && rm -f "$tgt_file"   # stale symlink only
   ln -s "$src_file" "$tgt_file"
 
   local src_sub="${src_base}/projects/${proj}/${sid}"
-  if [[ -d "$src_sub" ]]; then
+  if [[ -d "$src_sub" && ! -L "$src_sub" ]]; then
     local tgt_sub="${tgt_dir}/${sid}"
-    [[ -e "$tgt_sub" || -L "$tgt_sub" ]] && rm -rf "$tgt_sub"
-    ln -s "$src_sub" "$tgt_sub"
+    [[ -d "$tgt_sub" && ! -L "$tgt_sub" ]] || {   # only touch if target isn't a real dir
+      [[ -L "$tgt_sub" ]] && rm -f "$tgt_sub"
+      ln -s "$src_sub" "$tgt_sub"
+    }
   fi
   [[ "$verbose" == verbose ]] && cr_say "${C_DIM}linked session ${sid:0:8}… from '${owner}' → '${target}'${C_RESET}"
   CR_LINK_OWNER="$owner"   # expose for callers
@@ -595,6 +646,7 @@ cr_cmd_help() {
   cmd "cr policy <p>"              "round-robin | lru | random | usage-aware"
   cmd "cr use <name>"              "pin the account a plain 'cr' uses"
   cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
+  cmd "cr config [key val]"        "tune exhausted-at % / auto-refresh / ttl"
   cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
 
   head "Sessions"
@@ -673,6 +725,7 @@ main() {
     use)              shift; cr_cmd_use "$@" ;;
     unuse)            shift; cr_cmd_unuse ;;
     policy)           shift; cr_cmd_policy "$@" ;;
+    config)           shift; cr_cmd_config "$@" ;;
     usage)            shift; cr_cmd_usage "$@" ;;
     adopt)            shift; cr_cmd_adopt "$@" ;;
     status)           shift; cr_cmd_status "$@" ;;
