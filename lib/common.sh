@@ -18,11 +18,26 @@ CR_OAUTH_BETA="oauth-2025-04-20"
 # Paths shared (symlinked) from ~/.claude into each account dir at onboarding.
 CR_SHARE_PATHS=(settings.json CLAUDE.md commands rules)
 
+# --- Color palette -------------------------------------------------------
+# Enabled only when stderr is a TTY and NO_COLOR is unset (https://no-color.org).
+# Every name is always defined (empty when disabled) so callers never break.
+if [[ -t 2 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  C_RESET=$'\033[0m';  C_DIM=$'\033[2m';    C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m';   C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m';  C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+  C_GREY=$'\033[90m'
+else
+  C_RESET='' C_DIM='' C_BOLD='' C_RED='' C_GREEN='' C_YELLOW='' \
+  C_BLUE='' C_MAGENTA='' C_CYAN='' C_GREY=''
+fi
+# Accent used for the brand mark / arrows.
+C_ACCENT="$C_MAGENTA"
+
 # --- Output --------------------------------------------------------------
 # All diagnostic output goes to stderr so `cr -p` stdout stays pipeable.
 cr_say()  { printf '%s\n' "$*" >&2; }
-cr_warn() { printf 'cr: %s\n' "$*" >&2; }
-cr_die()  { printf 'cr: %s\n' "$*" >&2; exit 1; }
+cr_warn() { printf '%scr%s %s%s\n' "$C_YELLOW" "$C_RESET" "$*" "" >&2; }
+cr_die()  { printf '%scr%s %s%s\n' "$C_RED" "$C_RESET" "$*" "" >&2; exit 1; }
 
 cr_have() { command -v "$1" >/dev/null 2>&1; }
 

@@ -157,6 +157,13 @@ into `cr`.
 - The `/api/oauth/usage` endpoint is undocumented; `cr usage` is best-effort and
   degrades gracefully.
 
+## Appearance
+
+`cr` colorizes its banner, `list`, `status`, and `help` when stderr is a
+terminal. It honors [`NO_COLOR`](https://no-color.org) and a `dumb` `$TERM`, and
+strips all styling automatically when output is piped — so `cr -p …` stdout and
+any captured output stay clean.
+
 ## Tests
 
 ```sh

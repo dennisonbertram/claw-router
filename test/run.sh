@@ -109,7 +109,8 @@ echo "== launch: banner goes to stderr, not stdout =="
 seed
 "$CR" --account work -p x >"$SBX/stdout" 2>"$SBX/stderr"
 eq "stdout clean (banner on stderr)" "$(cat "$SBX/stdout")" ""
-if grep -q 'claude-router → work' "$SBX/stderr"; then ok "banner on stderr"; else bad "banner on stderr" "missing"; fi
+# Banner identifies the chosen account on stderr (color stripped — not a TTY in tests).
+if grep -q 'work' "$SBX/stderr" && grep -q '◆' "$SBX/stderr"; then ok "banner on stderr"; else bad "banner on stderr" "missing ◆/account: $(cat "$SBX/stderr")"; fi
 
 echo "== round-robin end to end =="
 seed

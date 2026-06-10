@@ -98,7 +98,11 @@ cr_launch() {
   local v; for v in "${CR_SCRUB_ENV[@]}"; do unset "$v"; done
   if [[ -n "$dir" ]]; then export CLAUDE_CONFIG_DIR="$dir"; else unset CLAUDE_CONFIG_DIR; fi
 
-  cr_say "▶ claude-router → ${account}  ${email}  (${plan})  [${forced:+forced}${forced:-policy: $policy}]"
+  printf '%s◆%s %s%s%s %s%s%s %s(%s)%s %s%s%s\n' \
+    "$C_ACCENT" "$C_RESET" "$C_BOLD" "$account" "$C_RESET" \
+    "$C_GREY" "$email" "$C_RESET" \
+    "$C_GREY" "$plan" "$C_RESET" \
+    "$C_DIM" "$([[ -n "$forced" ]] && echo "· forced" || echo "· $policy")" "$C_RESET" >&2
   printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$account" "${dir:-(default)}" >> "$CR_LOG" 2>/dev/null || true
 
   local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
@@ -135,7 +139,11 @@ cr_launch_backend() {
   [[ -n "$model" ]] && export ANTHROPIC_MODEL="$model"
   unset CLAUDE_CONFIG_DIR
 
-  cr_say "▶ claude-router → ${account}  (backend: ${baseurl##https://})  model=${model:-default}  [explicit]"
+  printf '%s◆%s %s%s%s %s(backend %s)%s %smodel=%s%s %s· explicit%s\n' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$account" "$C_RESET" \
+    "$C_GREY" "${baseurl##https://}" "$C_RESET" \
+    "$C_GREY" "${model:-default}" "$C_RESET" \
+    "$C_DIM" "$C_RESET" >&2
   printf '%s\t%s\tbackend:%s\n' "$(date -u +%FT%TZ)" "$account" "$baseurl" >> "$CR_LOG" 2>/dev/null || true
 
   local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
@@ -325,20 +333,39 @@ cr_cmd_list() {
     cr_say "Register your current ~/.claude login with:  cr register-default"
     return 0
   fi
-  printf '%s\n' "$rows" | jq -r '
+  local pinned; pinned="$(printf '%s' "$rows" | jq -r '.defaultAccount // empty')"
+  # Build the table uncolored (so `column -t` aligns on true widths), then tint
+  # only whole lines afterwards — header bold, backend rows yellow, pinned row bold.
+  local table
+  table="$(printf '%s\n' "$rows" | jq -r --arg PIN "$pinned" '
     "NAME\tKIND\tEMAIL / ENDPOINT\tPLAN / MODEL\tLAST USED\tUSAGE\tON\tROTATES",
     (.accounts[] |
       ( (.kind // "subscription") ) as $k |
-      [ .name,
+      [ (if .name==$PIN then "★ "+.name else .name end),
         $k,
         (if $k=="backend" then (.baseUrl // "?" | sub("^https?://";"")) else (.email // "?") end),
         (if $k=="backend" then (.model // "?") else (.plan // "?") end),
-        (if (.lastUsed // 0) == 0 then "never"
-         else (.lastUsed/1000 | strftime("%Y-%m-%d %H:%M")) end),
+        (if (.lastUsed // 0) == 0 then "never" else (.lastUsed/1000 | strftime("%Y-%m-%d %H:%M")) end),
         (if .usagePct == null then "-" else "\(.usagePct|floor)%" end),
         (if .enabled == false then "no" else "yes" end),
         (if $k=="backend" then "explicit-only" else "yes" end)
-      ] | @tsv)' | column -t -s $'\t' >&2
+      ] | @tsv)' | column -t -s $'\t')"
+
+  printf '\n' >&2
+  local first=1 line
+  while IFS= read -r line; do
+    if ((first)); then
+      printf '  %s%s%s\n' "$C_BOLD" "$line" "$C_RESET" >&2; first=0
+    elif [[ "$line" == *"backend"* ]]; then
+      printf '  %s%s%s\n' "$C_YELLOW" "$line" "$C_RESET" >&2
+    elif [[ "$line" == "★ "* ]]; then
+      printf '  %s%s%s\n' "$C_BOLD" "$line" "$C_RESET" >&2
+    else
+      printf '  %s\n' "$line" >&2
+    fi
+  done <<< "$table"
+  [[ -n "$pinned" ]] && printf '\n  %s★ pinned via '\''cr use'\'' — clear with '\''cr use --clear'\''%s\n' "$C_DIM" "$C_RESET" >&2
+  printf '\n' >&2
 }
 
 cr_cmd_usage() {
@@ -364,15 +391,24 @@ cr_cmd_status() {
   policy="$(cr_config_read | jq -r '.selection // "round-robin"')"
   def="$(cr_config_read | jq -r '.defaultAccount // empty')"
   n="$(cr_enabled_accounts | grep -c . || true)"
-  cr_say "policy: $policy   enabled accounts: $n${def:+   default(use): $def}"
+  printf '\n  %spolicy%s %s%s%s    %ssubscriptions%s %s%s%s%s\n' \
+    "$C_GREY" "$C_RESET" "$C_CYAN" "$policy" "$C_RESET" \
+    "$C_GREY" "$C_RESET" "$C_BOLD" "$n" "$C_RESET" \
+    "$([[ -n "$def" ]] && printf '    %spinned%s %s%s%s' "$C_GREY" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET")" >&2
   if [[ "$n" -gt 0 ]]; then
-    local pick
-    if [[ -n "$def" ]]; then pick="$def (pinned via 'cr use')"
-    elif [[ "$policy" == lru ]]; then pick="$(cr_select_lru) (would pick now)"
-    elif [[ "$policy" == usage-aware ]]; then pick="$(cr_select_usage_aware) (would pick now)"
-    else pick="(next in rotation — run a plain 'cr' to advance)"; fi
-    cr_say "next plain 'cr' → $pick"
+    local pick note
+    if [[ -n "$def" ]]; then pick="$def"; note="pinned via 'cr use'"
+    elif [[ "$policy" == lru ]]; then pick="$(cr_select_lru)"; note="would pick now"
+    elif [[ "$policy" == usage-aware ]]; then pick="$(cr_select_usage_aware)"; note="most headroom"
+    else pick=""; note="next in rotation — run a plain 'cr' to advance"; fi
+    if [[ -n "$pick" ]]; then
+      printf '  %snext%s   %s◆ %s%s %s(%s)%s\n' \
+        "$C_GREY" "$C_RESET" "$C_ACCENT$C_BOLD" "$pick" "$C_RESET" "$C_DIM" "$note" "$C_RESET" >&2
+    else
+      printf '  %snext%s   %s%s%s\n' "$C_GREY" "$C_RESET" "$C_DIM" "$note" "$C_RESET" >&2
+    fi
   fi
+  printf '\n' >&2
 }
 
 cr_doctor() {
@@ -402,53 +438,57 @@ cr_doctor() {
 }
 
 cr_cmd_help() {
-  cr_say "claude-router (cr) — route Claude Code across multiple subscriptions
+  local b="$C_BOLD" d="$C_DIM" r="$C_RESET" a="$C_ACCENT" cy="$C_CYAN" gn="$C_GREEN" gy="$C_GREY"
+  # cmd col desc — aligns the description column with padding.
+  cmd() { printf '  %s%-30s%s %s%s%s\n' "$cy" "$1" "$r" "$gy" "$2" "$r" >&2; }
+  head() { printf '\n%s%s%s\n' "$b" "$1" "$r" >&2; }
+  ex()  { printf '  %s%-36s%s %s%s%s\n' "$gn" "$1" "$r" "$d" "$2" "$r" >&2; }
 
-Launch:
-  cr [claude args...]         pick an account by policy, then run claude
-  cr --account <name> [...]   force an account for this run
-  cr@<name> [...]             shorthand for --account <name>
-  cr --account <name> -- ...  everything after -- goes to claude
+  printf '\n  %s◆ claude-router%s %s(cr)%s  %s— spread Claude Code across your subscriptions%s\n' \
+    "$a$b" "$r" "$d" "$r" "$d" "$r" >&2
 
-Manage:
-  cr add <name>               create an account + browser login, cache identity
-  cr add-backend <name> …     register an alt-model endpoint (e.g. DeepSeek);
-                              flags: --base-url URL --model NAME --alias s=full
-                                     --seed-from-deep-claude
-                              (backends are explicit-only, never in rotation)
-  cr register-default [name]  register your existing ~/.claude login (default)
-  cr login <name>             (re)authenticate an account
-  cr logout <name>            log an account out (clears its keychain item)
-  cr remove <name>            unregister an account
-  cr list                     show accounts (alias: cr accounts)
-  cr use <name>               pin the account a plain 'cr' uses
-  cr use --clear  (unuse)     unpin; go back to the rotation policy
-  cr policy <p>               round-robin | lru | random | usage-aware
-  cr usage [name]             show usage meters per window (--plain for one line)
-  cr status                   show which account would run next
-  cr doctor [name]            verify dirs + keychain credentials
-  cr help                     this help
+  head "Launch"
+  cmd "cr [claude args...]"          "pick an account by policy, then run claude"
+  cmd "cr --account <name> [args]" "force a specific account for this run"
+  cmd "cr@<name> [args]"           "shorthand for --account <name>"
+  cmd "cr --account <name> -- ..."   "everything after -- is passed to claude"
 
-First-time setup:
-  cr register-default                  # adopt your current ~/.claude login
-  cr add work                          # browser-login a 2nd subscription
-  cr add personal                      # …and a 3rd
-  cr list                              # confirm they're registered
-  cr -p \"hello\"                        # round-robins across them
+  head "Accounts"
+  cmd "cr add <name>"              "browser-login a subscription, cache identity"
+  cmd "cr add-backend <name> ..."    "register an alt-model endpoint (e.g. DeepSeek)"
+  cmd "cr register-default [name]" "adopt your existing ~/.claude login"
+  cmd "cr login / logout <name>"   "(re)authenticate / sign out an account"
+  cmd "cr remove <name>"           "unregister an account"
+  cmd "cr list"                    "show all accounts (alias: accounts, ls)"
 
-Examples:
-  cr                                   # interactive session on the next account
-  cr -p \"summarize this repo\"          # one-shot, picked by policy
-  cr --dangerously-skip-permissions    # any claude flag is forwarded as-is
-  cr@work -p \"draft the PR\"            # force the 'work' subscription
-  cr@deepseek --model flash -p \"…\"     # use a backend (DeepSeek), explicit only
-  cr policy usage-aware && cr usage    # route to whichever has the most headroom
+  head "Routing"
+  cmd "cr policy <p>"              "round-robin | lru | random | usage-aware"
+  cmd "cr use <name>"              "pin the account a plain 'cr' uses"
+  cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
+  cmd "cr status"                  "show which account would run next, and why"
 
-Notes:
-  • Plain 'cr' rotates over SUBSCRIPTION accounts only; backends are
-    explicit-only (cr@<name>) and never auto-selected.
-  • 'cr use <name>' pins an account; 'cr use --clear' returns to rotation.
-  • The banner (which account ran) prints to stderr, so 'cr -p' stdout stays clean."
+  head "Inspect"
+  cmd "cr usage [name]"            "usage meters per window (--plain = one line)"
+  cmd "cr doctor [name]"           "verify dirs + keychain credentials"
+  cmd "cr help"                    "this help"
+
+  head "First-time setup"
+  ex "cr register-default"          "adopt your current ~/.claude login"
+  ex "cr add work"                  "browser-login a 2nd subscription"
+  ex "cr list"                      "confirm they're registered"
+  ex 'cr -p "hello"'                "round-robins across them"
+
+  head "Examples"
+  ex 'cr -p "summarize this repo"'  "one-shot, account picked by policy"
+  ex "cr --dangerously-skip-permissions" "any claude flag is forwarded as-is"
+  ex 'cr@work -p "draft the PR"'     "force the 'work' subscription"
+  ex 'cr@deepseek --model flash ...'   "use a backend (DeepSeek), explicit only"
+  ex "cr policy usage-aware && cr usage" "route to whichever has most headroom"
+
+  printf '\n%s  Plain %scr%s%s rotates over subscriptions only — backends are explicit-only (%scr@<name>%s%s).%s\n' \
+    "$d" "$cy" "$r" "$d" "$cy" "$r" "$d" "$r" >&2
+  printf '%s  The “which account” banner goes to stderr, so %scr -p%s%s output stays pipeable.%s\n\n' \
+    "$d" "$cy" "$r" "$d" "$r" >&2
 }
 
 # ------------------------------------------------------------------------
