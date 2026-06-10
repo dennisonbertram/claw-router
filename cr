@@ -42,11 +42,38 @@ cr_find_claude() {
 }
 
 # Detect a resume/continue invocation so we don't rotate onto the wrong account.
-cr_args_have_resume() {
-  local a
+# Echoes the kind on stdout: "resume <session-id>" | "resume" | "continue".
+cr_args_resume_kind() {
+  local i=1 a next
   for a in "$@"; do
-    case "$a" in --continue|-c|--resume) return 0 ;; esac
+    case "$a" in
+      --continue|-c) printf 'continue'; return 0 ;;
+      --resume)
+        # The session id, if present, is the next argument.
+        next="${@:$((i+1)):1}"
+        if [[ -n "$next" && "$next" != -* ]]; then printf 'resume %s' "$next"
+        else printf 'resume'; fi
+        return 0 ;;
+      --resume=*) printf 'resume %s' "${a#--resume=}"; return 0 ;;
+    esac
+    i=$((i+1))
   done
+  return 1
+}
+
+# Given a session id, echo the name of the account whose config dir contains
+# its transcript (projects/*/<id>.jsonl). Empty if none / not found.
+cr_account_owning_session() {
+  local sid="$1" name dir base
+  [[ -z "$sid" ]] && return 1
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    dir="$(cr_account_dir "$name" 2>/dev/null || true)"
+    base="${dir:-$HOME/.claude}"
+    if compgen -G "${base}/projects/*/${sid}.jsonl" >/dev/null 2>&1; then
+      printf '%s' "$name"; return 0
+    fi
+  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription")|.name')
   return 1
 }
 
@@ -68,11 +95,26 @@ cr_launch() {
       [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
       cr_die "no accounts registered. Run: cr add <name>"
     fi
+    local rkind; rkind="$(cr_args_resume_kind "$@" || true)"
     if [[ "$n" -eq 1 ]]; then
       account="$(cr_enabled_accounts | head -1)"
-    elif cr_args_have_resume "$@"; then
-      account="$(cr_select lru)"
-      cr_warn "resume/continue detected — routing to least-recently-used ('$account'). Use --account to pin."
+    elif [[ -n "$rkind" ]]; then
+      # Resume/continue: route to the account that actually owns the session,
+      # so transcripts from one account aren't looked for under another.
+      local sid="${rkind#resume }"; [[ "$rkind" == "$sid" ]] && sid=""  # only set for `resume <id>`
+      local owner=""
+      if [[ -n "$sid" ]]; then owner="$(cr_account_owning_session "$sid" || true)"; fi
+      if [[ -n "$owner" ]]; then
+        account="$owner"
+        cr_say "${C_DIM}resume → '${owner}' owns session ${sid:0:8}…${C_RESET}"
+      else
+        account="$(cr_select lru)"
+        if [[ -n "$sid" ]]; then
+          cr_warn "no account owns session ${sid:0:8}… — trying least-recently-used ('$account'). Pin with --account if wrong."
+        else
+          cr_warn "resume/continue without a session id can't be matched to an account — using least-recently-used ('$account'). Pin with --account, or pass the full session id."
+        fi
+      fi
     else
       account="$(cr_select "$policy")" || cr_die "selection failed for policy '$policy'"
     fi
@@ -385,6 +427,51 @@ cr_cmd_usage() {
   fi
 }
 
+# Make a session owned by one account resumable under another, by symlinking the
+# transcript into the target account's config dir (same project path).
+#   cr adopt <session-id> <target-account>
+cr_cmd_adopt() {
+  local sid="${1:-}" target="${2:-}"
+  [[ -z "$sid" || -z "$target" ]] && cr_die "usage: cr adopt <session-id> <target-account>"
+  cr_ensure_home
+  cr_account_exists "$target" || cr_die "unknown target account: $target"
+  [[ "$(cr_account_kind "$target")" == "backend" ]] && cr_die "backends don't store sessions; pick a subscription account"
+
+  local owner; owner="$(cr_account_owning_session "$sid" || true)"
+  [[ -z "$owner" ]] && cr_die "no account owns session ${sid} (nothing to adopt)"
+  [[ "$owner" == "$target" ]] && cr_die "'$target' already owns that session"
+
+  local src_base tgt_base
+  src_base="$(cr_account_dir "$owner" 2>/dev/null || true)"; src_base="${src_base:-$HOME/.claude}"
+  tgt_base="$(cr_account_dir "$target" 2>/dev/null || true)"; tgt_base="${tgt_base:-$HOME/.claude}"
+
+  # Locate the transcript and its enclosing project dir under the owner.
+  local src_file proj
+  src_file="$(compgen -G "${src_base}/projects/*/${sid}.jsonl" 2>/dev/null | head -1)"
+  [[ -z "$src_file" ]] && cr_die "could not locate transcript for ${sid} under '$owner'"
+  proj="$(basename "$(dirname "$src_file")")"
+
+  local tgt_dir="${tgt_base}/projects/${proj}"
+  mkdir -p "$tgt_dir"
+  local tgt_file="${tgt_dir}/${sid}.jsonl"
+  if [[ -e "$tgt_file" || -L "$tgt_file" ]]; then
+    cr_warn "target already has ${sid}.jsonl — replacing the link"
+    rm -f "$tgt_file"
+  fi
+  ln -s "$src_file" "$tgt_file"
+
+  # Subagent transcripts live in a sibling <id>/ dir; link it too if present.
+  local src_sub="${src_base}/projects/${proj}/${sid}"
+  if [[ -d "$src_sub" ]]; then
+    local tgt_sub="${tgt_dir}/${sid}"
+    [[ -e "$tgt_sub" || -L "$tgt_sub" ]] && rm -rf "$tgt_sub"
+    ln -s "$src_sub" "$tgt_sub"
+  fi
+
+  cr_say "Adopted session ${sid:0:8}… : '${owner}' → '${target}' (symlinked, shared history)."
+  cr_say "Resume it under the target with:  cr@${target} --resume ${sid}"
+}
+
 cr_cmd_status() {
   cr_ensure_home
   # Optional: refresh live usage before drawing (otherwise use cached snapshot).
@@ -482,6 +569,9 @@ cr_cmd_help() {
   cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
   cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
 
+  head "Sessions"
+  cmd "cr adopt <id> <account>"    "let <account> resume a session owned by another (symlink)"
+
   head "Inspect"
   cmd "cr usage [name]"            "usage meters per window (--plain = one line)"
   cmd "cr doctor [name]"           "verify dirs + keychain credentials"
@@ -537,6 +627,7 @@ main() {
     unuse)            shift; cr_cmd_unuse ;;
     policy)           shift; cr_cmd_policy "$@" ;;
     usage)            shift; cr_cmd_usage "$@" ;;
+    adopt)            shift; cr_cmd_adopt "$@" ;;
     status)           shift; cr_cmd_status "$@" ;;
     doctor)           shift; cr_doctor "${1:-}" ;;
     help|--help|-h)   cr_cmd_help ;;

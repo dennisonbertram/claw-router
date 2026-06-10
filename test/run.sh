@@ -225,6 +225,36 @@ so="$("$CR" status 2>&1)"; rc=$?
 eq "status exits 0 without cache" "$rc" "0"
 if grep -q 'cr usage' <<<"$so"; then ok "status hints to run cr usage"; else bad "status hint" "$so"; fi
 
+echo "== resume routes to the account that owns the session =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/work/projects/-proj" "$CR_HOME/accounts/home"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"home","kind":"subscription","configDir":"$CR_HOME/accounts/home","email":"h@x","plan":"max","lastUsed":5,"enabled":true},
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"w@x","plan":"max","lastUsed":99,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+SID_OWN="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+echo '{}' > "$CR_HOME/accounts/work/projects/-proj/$SID_OWN.jsonl"   # owned by 'work' (NOT the lru)
+run_cr --resume "$SID_OWN" -p x
+eq "resume routes to owning account (work), not lru (home)" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/work"
+# Unknown session id → falls back to lru (home), doesn't crash.
+run_cr --resume "deadbeef-0000-0000-0000-000000000000" -p x
+eq "unknown session falls back to lru (home)" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/home"
+
+echo "== adopt symlinks a session into another account =="
+SID_AD="adadadad-0000-1111-2222-333333333333"
+echo '{"x":1}' > "$CR_HOME/accounts/work/projects/-proj/$SID_AD.jsonl"
+"$CR" adopt "$SID_AD" home 2>"$SBX/stderr"
+link="$CR_HOME/accounts/home/projects/-proj/$SID_AD.jsonl"
+if [[ -L "$link" ]]; then ok "adopt creates a symlink in target"; else bad "adopt symlink" "not a symlink: $link"; fi
+eq "adopted link resolves to source content" "$(cat "$link" 2>/dev/null)" '{"x":1}'
+# After adopt, resuming under 'home' must route to home (it now owns a copy too).
+run_cr --account home --resume "$SID_AD" -p x
+eq "adopted session resumable under target account" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/home"
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

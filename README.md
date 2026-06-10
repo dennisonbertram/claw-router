@@ -143,14 +143,36 @@ and keychain tools keep working), and stores its API key under cr's own Keychain
 item (`claude-router-backend` / `<name>`). It's effectively `deep-claude` folded
 into `cr`.
 
+## Sessions across accounts
+
+Claude Code stores each conversation under the account that created it
+(`<config-dir>/projects/<cwd>/<id>.jsonl`). `cr` handles this two ways:
+
+- **Resume routes automatically.** `cr --resume <id>` (or `-c` / `--continue`)
+  detects which account owns that session and launches under it — no more
+  "No conversation found" from landing on the wrong account. If the id can't be
+  matched (e.g. bare `--continue`), it falls back to least-recently-used and
+  says so; pin with `--account` to be certain.
+- **Adopt to continue someone else's convo.** `cr adopt <id> <account>`
+  symlinks a session into another account's store so that account can resume it:
+
+  ```sh
+  cr adopt 5fe702a8-… personal     # let 'personal' continue a session 'work' started
+  cr@personal --resume 5fe702a8-…  # …then resume it there
+  ```
+
+  It's a symlink, so both accounts share one evolving transcript. Whichever
+  account you resume under is the one billed for the new turns. Subagent
+  transcripts are linked too.
+
 ## Notes & limits
 
 - **macOS-first.** Keychain isolation is the clean path on macOS. On Linux the
   same model works via `CLAUDE_CONFIG_DIR`/`.credentials.json` but the Keychain
   checks in `cr doctor` are skipped.
-- **`--continue` / `--resume`** route to the least-recently-used account and warn,
-  since the session belongs to whichever account created it. Pin with
-  `--account <name>` to be sure.
+- **`--resume <id>`** routes to the account that owns the session automatically
+  (see *Sessions across accounts*). A bare `--continue` has no id to match, so it
+  falls back to least-recently-used with a warning — pin with `--account`.
 - **Shared settings.** `cr add` symlinks `settings.json`, `CLAUDE.md`,
   `commands/`, and `rules/` from `~/.claude` so your config isn't fragmented;
   per-account history/projects stay separate.
