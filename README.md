@@ -181,7 +181,7 @@ cr@deepseek --model flash -p "…"         # alias → deepseek-v4-flash
 A backend launch sets `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
 `ANTHROPIC_MODEL`, leaves `CLAUDE_CONFIG_DIR` and **`HOME` untouched** (so `gh`
 and keychain tools keep working), and stores its API key under cr's own Keychain
-item (`claude-router-backend` / `<name>`). It's effectively `deep-claude` folded
+item (`claw-router-backend` / `<name>`). It's effectively `deep-claude` folded
 into `cr`.
 
 ## Sandbox mode

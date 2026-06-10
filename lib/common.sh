@@ -4,7 +4,16 @@
 # defining functions and the CR_HOME/CONFIG path vars.
 
 # --- Paths ---------------------------------------------------------------
-: "${CR_HOME:=${HOME}/.claude-router}"
+# Data dir: prefer the new ~/.claw-router, but keep using a pre-existing
+# ~/.claude-router so we never orphan accounts (each account's Keychain login is
+# keyed off the absolute path of its config dir — moving it would break logins).
+if [[ -z "${CR_HOME:-}" ]]; then
+  if [[ -d "${HOME}/.claude-router" && ! -d "${HOME}/.claw-router" ]]; then
+    CR_HOME="${HOME}/.claude-router"   # legacy install — leave it in place
+  else
+    CR_HOME="${HOME}/.claw-router"     # fresh install
+  fi
+fi
 CR_CONFIG="${CR_HOME}/config.json"
 CR_ACCOUNTS_DIR="${CR_HOME}/accounts"
 CR_LOG="${CR_HOME}/logs/route.log"
@@ -136,7 +145,7 @@ cr_enabled_accounts() {
 }
 
 # Keychain service under which cr stores its own backend API keys.
-CR_BACKEND_KEYCHAIN_SVC="claude-router-backend"
+CR_BACKEND_KEYCHAIN_SVC="claw-router-backend"
 
 # Read a backend account's API key from cr's keychain item (macOS) or, as a
 # fallback, from a plaintext key cached in the registry. Echoes the key.
