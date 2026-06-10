@@ -180,11 +180,18 @@ cr_cmd_remove() {
 }
 
 cr_cmd_use() {
-  local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr use <name>"
+  local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr use <name>  (or: cr use --clear)"
+  if [[ "$name" == "--clear" || "$name" == "none" ]]; then
+    cr_config_update 'del(.defaultAccount)'
+    cr_say "Cleared pinned account. Plain 'cr' now follows the '$(cr_config_read | jq -r '.selection')' policy."
+    return 0
+  fi
   cr_account_exists "$name" || cr_die "unknown account: $name"
   cr_config_update '.defaultAccount = $n' --arg n "$name"
-  cr_say "Default account for plain 'cr' set to '$name'. (Note: overrides rotation policy.)"
+  cr_say "Default account for plain 'cr' set to '$name'. (Note: overrides rotation policy. Undo with: cr use --clear)"
 }
+
+cr_cmd_unuse() { cr_cmd_use --clear; }
 
 cr_cmd_policy() {
   local p="${1:-}"
@@ -221,13 +228,17 @@ cr_cmd_list() {
 cr_cmd_usage() {
   cr_ensure_home
   cr_require_deps
+  cr_have curl || cr_die "cr usage needs curl"
+  local plain=0
+  if [[ "${1:-}" == "--plain" ]]; then plain=1; shift; fi
   local name="${1:-}"
-  if [[ -n "$name" ]]; then
-    cr_account_exists "$name" || cr_die "unknown account: $name"
-    cr_poll_account "$name" >&2
+  [[ -n "$name" ]] && { cr_account_exists "$name" || cr_die "unknown account: $name"; }
+
+  if [[ "$plain" -eq 1 ]]; then
+    if [[ -n "$name" ]]; then cr_poll_account "$name" >&2
+    else local a; while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_enabled_accounts); fi
   else
-    local a
-    while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_enabled_accounts)
+    cr_render_meters "$name"
   fi
 }
 
@@ -285,8 +296,9 @@ Manage:
   cr remove <name>            unregister an account
   cr list                     show accounts (alias: cr accounts)
   cr use <name>               pin the account a plain 'cr' uses
+  cr use --clear  (unuse)     unpin; go back to the rotation policy
   cr policy <p>               round-robin | lru | random | usage-aware
-  cr usage [name]             poll live usage and cache it for usage-aware
+  cr usage [name]             show usage meters per window (--plain for one line)
   cr status                   show which account would run next
   cr doctor [name]            verify dirs + keychain credentials
   cr help"
@@ -319,6 +331,7 @@ main() {
     remove|rm)        shift; cr_cmd_remove "$@" ;;
     list|accounts|ls) shift; cr_cmd_list ;;
     use)              shift; cr_cmd_use "$@" ;;
+    unuse)            shift; cr_cmd_unuse ;;
     policy)           shift; cr_cmd_policy "$@" ;;
     usage)            shift; cr_cmd_usage "$@" ;;
     status)           shift; cr_cmd_status ;;

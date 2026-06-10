@@ -73,8 +73,9 @@ Manage (never forwarded to claude):
 | `cr remove <name>` | unregister (prints how to delete its dir + keychain item) |
 | `cr list` (`accounts`, `ls`) | table of accounts: email, plan, last used, usage%, enabled |
 | `cr use <name>` | pin the account a plain `cr` uses (overrides rotation) |
+| `cr use --clear` (`cr unuse`) | un-pin; go back to the rotation policy |
 | `cr policy <p>` | `round-robin` \| `lru` \| `random` \| `usage-aware` |
-| `cr usage [name]` | poll live usage and cache it (feeds `usage-aware`) |
+| `cr usage [name]` | show usage meters per window (`--plain` for one-line text) |
 | `cr status` | which account would run next, and why |
 | `cr doctor [name]` | verify each account's dir + keychain credential |
 
@@ -87,8 +88,24 @@ Manage (never forwarded to claude):
   numbers from `cr usage`. Run `cr usage` periodically (or wire it to a cron) to
   refresh the cached figures; falls back to `lru` if usage data is unavailable.
 
-Tip: `cr usage` shows the 5-hour and 7-day windows with reset times, so you can
-see at a glance which subscription to lean on.
+Tip: `cr usage` draws a meter of how much is left in each window (5-hour session,
+7-day total, and per-model 7-day) with reset countdowns, so you can see at a
+glance which subscription to lean on:
+
+```
+usage left per window  (█ = available)
+
+  default  you@work.com
+    5h session  █████████░░░░░░░░░░░░░  42% left   resets in 1h17m
+    7d total    ███████████████████░░░  88% left   resets in 2d13h
+
+  personal  you@gmail.com
+    5h session  ██████████████████████ 100% left   resets in 4h47m
+    7d total    ██████████████████████ 100% left   resets in 4d22h
+```
+
+Bars are colored green/yellow/red by headroom. `cr usage --plain` prints a
+single line per account instead.
 
 ## Notes & limits
 
