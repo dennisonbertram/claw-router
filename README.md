@@ -103,6 +103,7 @@ Launch (anything unrecognized is forwarded verbatim to `claude`):
 | `cr --account <name> [args…]` | force an account |
 | `cr@<name> [args…]` | shorthand for `--account <name>` |
 | `cr --sandbox` / `-s [args…]` | run the session inside a [cco](https://github.com/nikvdp/cco) sandbox |
+| `cr --watch` / `-w [args…]` | supervised launch: auto-handoff to a fresher account near the limit |
 | `cr --account <name> -- [args…]` | `--` ends cr's flags; the rest is claude's |
 
 Manage (never forwarded to claude):
@@ -221,6 +222,41 @@ tells you the one-line install:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nikvdp/cco/master/install.sh | bash
 ```
+
+## Watch mode
+
+Add `--watch` (or `-w`) to stay in the conversation past your account's usage
+limit. Instead of `exec`-ing claude and stepping away, `cr` stays alive,
+watches the current account's usage in the background every two minutes, and
+when usage nears its limit gracefully restarts claude under a fresher account
+with `--resume` — the conversation continues because the session transcript is
+symlinked across accounts via the existing session-linking machinery.
+
+```sh
+cr --watch                           # interactive session, auto-handoff when near limit
+cr -w --account work                 # force starting account
+cr --watch --resume <id>             # pick up an existing session and keep watching
+```
+
+The handoff happens at a turn boundary: `cr` waits until the session transcript
+has been idle for at least 30 seconds (configurable), so an in-flight reply is
+never interrupted mid-stream. The restart takes only a few seconds.
+
+Three knobs (all configurable via `cr config`):
+
+```sh
+cr config watch-at 90        # hand off when usage reaches 90% (default)
+cr config watch-interval 120 # poll every 120s (default)
+cr config watch-idle 30      # wait for 30s of session inactivity before handing off (default)
+```
+
+Bypasses (watch silently degrades and runs normally):
+
+- `-p` / `--print` — one-shot; no session to watch.
+- Backends (`cr@deepseek`) — no usage data to poll.
+- Only one enabled subscription account — nowhere to hand off to.
+
+`--watch` composes with `--sandbox` (best-effort: both flags are independent).
 
 ## Sessions across accounts
 

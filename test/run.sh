@@ -377,6 +377,294 @@ JSON
   if [[ -f "$dest" && ! -L "$dest" ]] && grep -q DEST_REAL "$dest"; then ok "real target transcript left intact (not clobbered)"; else bad "link safety" "target was destroyed or replaced: $(ls -l "$dest" 2>&1)"; fi
 )
 
+# -------------------------------------------------------------------------
+# Watch mode tests
+# -------------------------------------------------------------------------
+export CR_NO_USAGE_POLL=1
+
+echo "== watch: strip resume args (unit) =="
+(
+  export CR_HOME="$SBX/watch_strip_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  source "$CR_REPO/lib/watch.sh"
+
+  cr_watch_strip_resume --resume abc -p x
+  eq "strip --resume <val> -p x => -p x" "${CR_WATCH_ARGS[*]}" "-p x"
+
+  cr_watch_strip_resume --resume=abc --continue -c foo
+  eq "strip --resume=abc --continue -c foo => foo" "${CR_WATCH_ARGS[*]}" "foo"
+
+  cr_watch_strip_resume -p x
+  eq "nothing to strip: -p x => -p x" "${CR_WATCH_ARGS[*]}" "-p x"
+
+  # A flag right after a bare --resume is NOT the session id — keep it.
+  cr_watch_strip_resume --resume --output-format json
+  eq "bare --resume followed by a flag keeps the flag" "${CR_WATCH_ARGS[*]}" "--output-format json"
+)
+
+echo "== watch: pick-next candidate (unit) =="
+(
+  export CR_HOME="$SBX/watch_pick_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  source "$CR_REPO/lib/watch.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","kind":"subscription","configDir":"$SBX/watch_pick_home/accounts/work","lastUsed":0,"enabled":true,"usagePct":95},
+  {"name":"home","kind":"subscription","configDir":"$SBX/watch_pick_home/accounts/home","lastUsed":0,"enabled":true,"usagePct":10},
+  {"name":"spare","kind":"subscription","configDir":"$SBX/watch_pick_home/accounts/spare","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"deepseek","kind":"backend","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"off","kind":"subscription","configDir":"$SBX/watch_pick_home/accounts/off","lastUsed":0,"enabled":false,"usagePct":5}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # work at 95%, pick_next at 90 should return home (lowest usagePct among eligible)
+  got="$(cr_watch_pick_next work 90)"
+  eq "pick_next: work exhausted -> home" "$got" "home"
+
+  # set home to 95 too; spare is null (unknown = eligible, ranked after known headroom)
+  cr_config_update '(.accounts[] | select(.name=="home") | .usagePct) = 95' >/dev/null
+  got="$(cr_watch_pick_next work 90)"
+  eq "pick_next: home exhausted, spare null -> spare" "$got" "spare"
+
+  # set spare to 95 too -> no eligible candidate
+  cr_config_update '(.accounts[] | select(.name=="spare") | .usagePct) = 95' >/dev/null
+  got="$(cr_watch_pick_next work 90)"
+  eq "pick_next: all exhausted -> empty" "$got" ""
+)
+
+echo "== watch: latest-session discovery (unit) =="
+(
+  export CR_HOME="$SBX/watch_disc_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  source "$CR_REPO/lib/watch.sh"
+
+  mkdir -p "$CR_HOME/accounts/acct1" "$CR_HOME/accounts/acct2"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"acct1","kind":"subscription","configDir":"$CR_HOME/accounts/acct1","lastUsed":0,"enabled":true},
+  {"name":"acct2","kind":"subscription","configDir":"$CR_HOME/accounts/acct2","lastUsed":0,"enabled":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+  MUNGED="$(pwd | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
+  mkdir -p "$CR_HOME/accounts/acct1/projects/$MUNGED"
+  mkdir -p "$CR_HOME/accounts/acct2/projects/$MUNGED"
+
+  # Create a marker file
+  MARKER="$SBX/disc_marker"
+  touch "$MARKER"
+  sleep 0.05 2>/dev/null || true
+
+  OLD_SID="11111111-0000-0000-0000-000000000000"
+  NEW_SID="22222222-0000-0000-0000-000000000000"
+  LINK_SID="33333333-0000-0000-0000-000000000000"
+
+  # Old file: mtime before marker (use year 2020 so definitely before marker)
+  touch -t 202001010000 "$CR_HOME/accounts/acct1/projects/$MUNGED/$OLD_SID.jsonl"
+
+  # Newer real file: mtime after marker
+  touch "$CR_HOME/accounts/acct2/projects/$MUNGED/$NEW_SID.jsonl"
+
+  # Symlink: should be excluded
+  ln -s "$CR_HOME/accounts/acct2/projects/$MUNGED/$NEW_SID.jsonl" \
+        "$CR_HOME/accounts/acct1/projects/$MUNGED/$LINK_SID.jsonl"
+
+  # With marker: only NEW_SID qualifies (old is before marker, link is excluded)
+  result="$(cr_watch_latest_session "$MARKER" || true)"
+  got_sid="${result%%	*}"
+  eq "discovery with marker: returns newer real sid" "$got_sid" "$NEW_SID"
+
+  # Without marker filter (empty arg): picks newest overall (NEW_SID, ignoring symlink)
+  result2="$(cr_watch_latest_session "" || true)"
+  got_sid2="${result2%%	*}"
+  eq "discovery no marker: picks newest real sid" "$got_sid2" "$NEW_SID"
+)
+
+echo "== watch: idle detection (unit) =="
+(
+  export CR_HOME="$SBX/watch_idle_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  source "$CR_REPO/lib/watch.sh"
+
+  OLD_FILE="$SBX/old_transcript.jsonl"
+  touch -t 202001010000 "$OLD_FILE"
+  if cr_watch_idle "$OLD_FILE" 30; then ok "old file is idle"; else bad "old file is idle" "expected idle"; fi
+
+  FRESH_FILE="$SBX/fresh_transcript.jsonl"
+  touch "$FRESH_FILE"
+  if cr_watch_idle "$FRESH_FILE" 60; then bad "fresh file not idle" "expected not-idle"; else ok "fresh file is not idle"; fi
+
+  if cr_watch_idle "" 30; then ok "empty path is idle"; else bad "empty path is idle" "expected idle"; fi
+)
+
+echo "== watch: config knobs =="
+(
+  export CR_HOME="$SBX/watch_cfg_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[],"rotation":{"cursor":0},"share":{}}
+JSON
+
+  "$CR_REPO/cr" config watch-at 85 2>/dev/null
+  got="$(cr_config_read | jq -r '.watchAtPct')"
+  eq "watch-at sets watchAtPct" "$got" "85"
+
+  "$CR_REPO/cr" config watch-interval 60 2>/dev/null
+  got="$(cr_config_read | jq -r '.watchIntervalSeconds')"
+  eq "watch-interval sets watchIntervalSeconds" "$got" "60"
+
+  "$CR_REPO/cr" config watch-idle 45 2>/dev/null
+  got="$(cr_config_read | jq -r '.watchIdleSeconds')"
+  eq "watch-idle sets watchIdleSeconds" "$got" "45"
+
+  # Invalid value should exit nonzero
+  "$CR_REPO/cr" config watch-at notanumber 2>/dev/null; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "invalid watch-at exits nonzero"; else bad "invalid watch-at exits nonzero" "rc=$rc"; fi
+)
+
+echo "== watch: -p bypasses watch =="
+(
+  export CR_HOME="$SBX/watch_p_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"home","kind":"subscription","configDir":"$CR_HOME/accounts/home","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  mkdir -p "$CR_HOME/accounts/work" "$CR_HOME/accounts/home"
+  "$CR_REPO/cr" --watch --account work -p hi >"$SBX/stdout" 2>"$SBX/watch_p_err"
+  if grep -q 'without watch' "$SBX/watch_p_err"; then ok "-p: stderr contains 'without watch'"; else bad "-p: without watch message" "$(cat "$SBX/watch_p_err")"; fi
+  if grep -q 'CONFIG_DIR=.*accounts/work' "$FAKE_OUT" 2>/dev/null || grep -q 'accounts/work' "$FAKE_OUT" 2>/dev/null; then ok "-p: single launch (not watched)"; else
+    # The fake claude writes to FAKE_OUT; check the args were passed
+    args_got="$(grep '^ARGS=' "$FAKE_OUT" 2>/dev/null || true)"
+    if [[ "$args_got" == "ARGS=-p hi" ]]; then ok "-p: single launch (not watched)"; else bad "-p: single launch" "$args_got"; fi
+  fi
+)
+
+echo "== watch: single account bypasses watch =="
+(
+  export CR_HOME="$SBX/watch_single_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"solo","kind":"subscription","configDir":"$CR_HOME/accounts/solo","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  mkdir -p "$CR_HOME/accounts/solo"
+  "$CR_REPO/cr" --watch x >"$SBX/stdout" 2>"$SBX/watch_single_err"
+  if grep -q 'only one account' "$SBX/watch_single_err"; then ok "single account: 'only one account' message"; else bad "single account bypass" "$(cat "$SBX/watch_single_err")"; fi
+)
+
+echo "== watch: end-to-end handoff =="
+WATCH_LOG="$SBX/watch_log"
+: > "$WATCH_LOG"
+export WATCH_LOG
+
+# Fresh config with two accounts, usage already near limit for 'work'.
+WCR_HOME="$SBX/watch_e2e_home"
+rm -rf "$WCR_HOME"; mkdir -p "$WCR_HOME/logs" "$WCR_HOME/accounts/work" "$WCR_HOME/accounts/home"
+NOW_MS="$(( $(date +%s) * 1000 ))"
+cat > "$WCR_HOME/config.json" <<JSON
+{"selection":"round-robin",
+ "watchAtPct":90, "watchIntervalSeconds":1, "watchIdleSeconds":0,
+ "accounts":[
+   {"name":"work","kind":"subscription","configDir":"$WCR_HOME/accounts/work",
+    "lastUsed":0,"enabled":true,"usagePct":95,
+    "usage":{"checkedAt":${NOW_MS},"windows":[]}},
+   {"name":"home","kind":"subscription","configDir":"$WCR_HOME/accounts/home",
+    "lastUsed":0,"enabled":true,"usagePct":10,
+    "usage":{"checkedAt":${NOW_MS},"windows":[]}}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+# Create a session transcript owned by 'work' (old mtime, so excluded by marker
+# => exercises the orig-sid fallback).
+SID_E2E="eeeeeeee-1111-2222-3333-444444444444"
+MUNGED_E2E="$(pwd | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
+mkdir -p "$WCR_HOME/accounts/work/projects/$MUNGED_E2E"
+printf '{"w":1}\n' > "$WCR_HOME/accounts/work/projects/$MUNGED_E2E/$SID_E2E.jsonl"
+touch -t 202001010000 "$WCR_HOME/accounts/work/projects/$MUNGED_E2E/$SID_E2E.jsonl"
+
+# Watch-aware fake claude: records invocation, on 2nd call exits immediately.
+cat > "$FAKEBIN/claude" <<'FAKE'
+#!/usr/bin/env bash
+echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>} ARGS=$*" >> "$WATCH_LOG"
+lines="$(wc -l < "$WATCH_LOG" | tr -d ' ')"
+if [[ "$lines" -ge 2 ]]; then
+  exit 0
+fi
+# First invocation: sleep interruptibly so watcher can SIGTERM us.
+sleep 60 &
+wait $! 2>/dev/null || true
+exit 0
+FAKE
+chmod +x "$FAKEBIN/claude"
+
+# Run in background with isolated CR_HOME, capturing stderr.
+CR_HOME="$WCR_HOME" "$CR_REPO/cr" --watch --account work --resume "$SID_E2E" \
+  2>"$SBX/watch_e2e_err" &
+WPID=$!
+
+# Poll up to 30 seconds for completion.
+DONE=0
+for _i in $(seq 1 60); do
+  sleep 0.5
+  if ! kill -0 "$WPID" 2>/dev/null; then DONE=1; break; fi
+done
+
+if [[ "$DONE" -ne 1 ]]; then
+  kill "$WPID" 2>/dev/null || true
+  bad "e2e handoff: completed within timeout" "still running after 30s"
+else
+  wait "$WPID" 2>/dev/null; WRC=$?
+  eq "e2e handoff: exit code 0" "$WRC" "0"
+
+  # Line 1: work account was launched with --resume $SID_E2E
+  LINE1="$(sed -n '1p' "$WATCH_LOG" 2>/dev/null || true)"
+  if [[ "$LINE1" == *"accounts/work"* ]]; then ok "e2e: line1 uses work account"; else bad "e2e: line1 work account" "$LINE1"; fi
+  if [[ "$LINE1" == *"--resume $SID_E2E"* ]]; then ok "e2e: line1 has --resume SID"; else bad "e2e: line1 --resume" "$LINE1"; fi
+
+  # Line 2: home account was launched with --resume $SID_E2E
+  LINE2="$(sed -n '2p' "$WATCH_LOG" 2>/dev/null || true)"
+  if [[ "$LINE2" == *"accounts/home"* ]]; then ok "e2e: line2 uses home account"; else bad "e2e: line2 home account" "$LINE2"; fi
+  if [[ "$LINE2" == *"--resume $SID_E2E"* ]]; then ok "e2e: line2 has --resume SID"; else bad "e2e: line2 --resume" "$LINE2"; fi
+
+  # Session symlinked into home account
+  LINK_PATH="$WCR_HOME/accounts/home/projects/$MUNGED_E2E/$SID_E2E.jsonl"
+  if [[ -L "$LINK_PATH" ]]; then ok "e2e: session symlinked into home account"; else bad "e2e: session symlink" "not a symlink: $LINK_PATH"; fi
+  LINK_CONTENT="$(cat "$LINK_PATH" 2>/dev/null | tr -d '\n' || true)"
+  if [[ "$LINK_CONTENT" == *'"w":1'* ]]; then ok "e2e: symlink resolves to work's content"; else bad "e2e: symlink content" "$LINK_CONTENT"; fi
+
+  # stderr should contain handoff banner
+  if grep -q '↻' "$SBX/watch_e2e_err"; then ok "e2e: stderr has handoff arrow"; else bad "e2e: handoff arrow in stderr" "$(cat "$SBX/watch_e2e_err")"; fi
+  if grep -q 'home' "$SBX/watch_e2e_err"; then ok "e2e: stderr mentions home account"; else bad "e2e: home in stderr" "$(cat "$SBX/watch_e2e_err")"; fi
+fi
+
+# Restore the standard fake claude (identical to the original at the top).
+cat > "$FAKEBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+{
+  echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "API_KEY=${ANTHROPIC_API_KEY-<unset>}"
+  echo "AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+  echo "ARGS=$*"
+} > "$FAKE_OUT"
+exit "${FAKE_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/claude"
+unset WATCH_LOG
+
+echo "== watch: natural child exit propagates, no handoff =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","email":"w@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":10},
+  {"name":"home","kind":"subscription","configDir":"$CR_HOME/accounts/home","email":"h@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":10}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+FAKE_EXIT=42 "$CR" --watch --account work x >/dev/null 2>"$SBX/stderr"; rc=$?
+eq "watch: natural child exit code propagates" "$rc" "42"
+if grep -q '↻' "$SBX/stderr"; then bad "watch: no handoff on natural exit" "unexpected handoff banner"; else ok "watch: no handoff on natural exit"; fi
+
 echo
 PASS=$(wc -c < "$SBX/.pass" | tr -d ' '); FAIL=$(wc -c < "$SBX/.fail" | tr -d ' ')
 echo "== $PASS passed, $FAIL failed =="

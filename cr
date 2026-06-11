@@ -23,6 +23,8 @@ CR_DIR="$(cd -P "$(dirname "$_cr_self")" >/dev/null 2>&1 && pwd)"
 source "${CR_DIR}/lib/common.sh"
 # shellcheck source=lib/usage.sh
 source "${CR_DIR}/lib/usage.sh"
+# shellcheck source=lib/watch.sh
+source "${CR_DIR}/lib/watch.sh"
 
 # Env that would override subscription OAuth (see precedence in PLAN.md §1.3).
 CR_SCRUB_ENV=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN)
@@ -148,6 +150,9 @@ cr_launch() {
   cr_mark_used "$account"
 
   if [[ "$kind" == "backend" ]]; then
+    if [[ "${CR_WATCH:-0}" == 1 ]]; then
+      cr_warn "watch: backends have no usage data — running without watch"
+    fi
     cr_launch_backend "$account" "$forced" "$@"
     return
   fi
@@ -170,6 +175,30 @@ cr_launch() {
     "$C_GREY" "$plan" "$C_RESET" \
     "$C_DIM" "$([[ -n "$forced" ]] && echo "· forced" || echo "· $policy")" "$C_RESET" >&2
   printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$account" "${dir:-(default)}" >> "$CR_LOG" 2>/dev/null || true
+
+  # --- watch mode bypasses -------------------------------------------------
+  if [[ "${CR_WATCH:-0}" == 1 ]]; then
+    # -p/--print is one-shot; no session to watch.
+    local _warg
+    for _warg in "$@"; do
+      if [[ "$_warg" == "-p" || "$_warg" == "--print" ]]; then
+        cr_warn "watch: -p/--print is one-shot — running without watch"
+        CR_WATCH=0
+        break
+      fi
+    done
+  fi
+  if [[ "${CR_WATCH:-0}" == 1 ]]; then
+    local _naccts; _naccts="$(cr_enabled_accounts | grep -c . || true)"
+    if [[ "$_naccts" -lt 2 ]]; then
+      cr_warn "watch: only one account — nothing to hand off to"
+      CR_WATCH=0
+    fi
+  fi
+  if [[ "${CR_WATCH:-0}" == 1 ]]; then
+    cr_watch_run "$account" "$policy" "$@"
+    # cr_watch_run never returns (exits directly).
+  fi
 
   cr_build_exec
   exec "${CR_EXEC[@]}" "$@"
@@ -402,6 +431,9 @@ cr_cmd_config() {
       cr_say "  exhausted-at  $(printf '%s' "$c" | jq -r '.exhaustedAtPct // 100')%   (skip accounts at/above this usage)"
       cr_say "  auto-refresh  $(printf '%s' "$c" | jq -r 'if (.autoRefreshUsage // true) then "on" else "off" end')   (poll usage before routing when stale)"
       cr_say "  ttl           $(printf '%s' "$c" | jq -r '.usageTtlSeconds // 900')s   (how long cached usage stays fresh)"
+      cr_say "  watch-at      $(printf '%s' "$c" | jq -r '.watchAtPct // 90')%   (hand off when usage reaches this % in watch mode)"
+      cr_say "  watch-interval $(printf '%s' "$c" | jq -r '.watchIntervalSeconds // 120')s  (poll interval in watch mode)"
+      cr_say "  watch-idle    $(printf '%s' "$c" | jq -r '.watchIdleSeconds // 30')s   (seconds of session inactivity before handing off)"
       ;;
     exhausted-at)
       [[ "$val" =~ ^[0-9]+$ ]] || cr_die "usage: cr config exhausted-at <0-100>"
@@ -417,7 +449,19 @@ cr_cmd_config() {
       [[ "$val" =~ ^[0-9]+$ ]] || cr_die "usage: cr config ttl <seconds>"
       cr_config_update '.usageTtlSeconds = ($v|tonumber)' --arg v "$val"
       cr_say "Usage cache TTL set to ${val}s." ;;
-    *) cr_die "unknown config key '$key' (exhausted-at | auto-refresh | ttl)" ;;
+    watch-at)
+      [[ "$val" =~ ^[0-9]+$ ]] || cr_die "usage: cr config watch-at <0-100>"
+      cr_config_update '.watchAtPct = ($v|tonumber)' --arg v "$val"
+      cr_say "Watch mode will hand off at ${val}% usage." ;;
+    watch-interval)
+      [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] || cr_die "usage: cr config watch-interval <positive integer seconds>"
+      cr_config_update '.watchIntervalSeconds = ($v|tonumber)' --arg v "$val"
+      cr_say "Watch poll interval set to ${val}s." ;;
+    watch-idle)
+      [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 ]] || cr_die "usage: cr config watch-idle <positive integer seconds>"
+      cr_config_update '.watchIdleSeconds = ($v|tonumber)' --arg v "$val"
+      cr_say "Watch idle threshold set to ${val}s." ;;
+    *) cr_die "unknown config key '$key' (exhausted-at | auto-refresh | ttl | watch-at | watch-interval | watch-idle)" ;;
   esac
 }
 
@@ -633,6 +677,7 @@ cr_cmd_help() {
   cmd "cr --account <name> -- ..."   "everything after -- is passed to claude"
   cmd "cr --resume <id>"           "resume any session — auto-linked into the picked account"
   cmd "cr --sandbox  (-s) [args]"  "run the session inside a cco sandbox (isolation)"
+  cmd "cr --watch   (-w) [args]"   "auto-handoff to a fresher account near the usage limit"
 
   head "Accounts"
   cmd "cr add <name>"              "browser-login a subscription, cache identity"
@@ -646,7 +691,7 @@ cr_cmd_help() {
   cmd "cr policy <p>"              "round-robin | lru | random | usage-aware"
   cmd "cr use <name>"              "pin the account a plain 'cr' uses"
   cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
-  cmd "cr config [key val]"        "tune exhausted-at % / auto-refresh / ttl"
+  cmd "cr config [key val]"        "tune exhausted-at / auto-refresh / ttl / watch-at / …"
   cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
 
   head "Sessions"
@@ -682,13 +727,18 @@ cr_cmd_help() {
 main() {
   cr_require_deps
 
-  # Extract the cr-owned --sandbox / -s flag from the launch flags (everything
-  # up to a `--` separator, after which args belong to claude). Sets CR_SANDBOX.
+  # Extract the cr-owned --sandbox / -s and --watch / -w flags from the launch
+  # flags (everything up to a `--` separator, after which args belong to claude).
+  # Sets CR_SANDBOX and CR_WATCH.
   CR_SANDBOX=0
+  CR_WATCH=0
   local _a _rest=() _seen_sep=0
   for _a in "$@"; do
     if [[ "$_seen_sep" == 0 && ( "$_a" == "--sandbox" || "$_a" == "-s" ) ]]; then
       CR_SANDBOX=1; continue
+    fi
+    if [[ "$_seen_sep" == 0 && ( "$_a" == "--watch" || "$_a" == "-w" ) ]]; then
+      CR_WATCH=1; continue
     fi
     [[ "$_a" == "--" ]] && _seen_sep=1
     _rest+=("$_a")
