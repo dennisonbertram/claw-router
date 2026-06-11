@@ -146,17 +146,25 @@ cr_render_account_meters() {
     | "\($e.lab)\t\((.utilization // .))\t\(.resets_at // "")"')
 }
 
-# Render meters for one account or all enabled accounts.
+# Render meters for one account or all enabled subscription accounts.
+# api accounts are skipped in all-accounts mode (pay-per-token, no usage windows).
+# If a specific api account is named explicitly, print a short note and return 0.
 cr_render_meters() {
   local name="${1:-}"
   cr_say "usage left per window  (█ = available)"
   if [[ -n "$name" ]]; then
+    local kind; kind="$(cr_account_kind "$name" 2>/dev/null || true)"
+    if [[ "$kind" == "api" ]]; then
+      cr_say "$name: api-key account — pay-per-token, no usage windows"
+      printf '\n' >&2
+      return 0
+    fi
     cr_render_account_meters "$name"
   else
     local a any=0
     while IFS= read -r a; do
       cr_render_account_meters "$a" && any=1 || true
-    done < <(cr_enabled_accounts)
+    done < <(cr_subscription_accounts)
     [[ "$any" -eq 0 ]] && cr_warn "no usage data available"
   fi
   printf '\n' >&2
@@ -220,7 +228,7 @@ cr_render_cached_bars() {
       done < <(printf '%s' "$wins" | jq -r '.[] | "\(.label)\t\(.used)\t\(.resets // "")"')
     fi
     printf '\n' >&2
-  done < <(cr_enabled_accounts)
+  done < <(cr_subscription_accounts)
   return $(( any ? 0 : 1 ))
 }
 
@@ -249,7 +257,8 @@ cr_refresh_usage_if_stale() {
   now_s="$(date +%s)"
   local stale; stale="$(cr_config_read | jq -r --argjson now "$now_s" --argjson ttl "$ttl" '
     .accounts[]
-    | select(.enabled != false) | select((.kind // "subscription") == "subscription")
+    | select(.enabled != false)
+    | select((.kind // "subscription") == "subscription")
     | select(((.usage.checkedAt // 0) / 1000) < ($now - $ttl))
     | .name')"
   [[ -z "$stale" ]] && return 0

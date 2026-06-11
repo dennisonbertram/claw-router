@@ -550,7 +550,7 @@ echo "== watch: single account bypasses watch =="
 JSON
   mkdir -p "$CR_HOME/accounts/solo"
   "$CR_REPO/cr" --watch x >"$SBX/stdout" 2>"$SBX/watch_single_err"
-  if grep -q 'only one account' "$SBX/watch_single_err"; then ok "single account: 'only one account' message"; else bad "single account bypass" "$(cat "$SBX/watch_single_err")"; fi
+  if grep -qE 'only one account|fewer than two subscription' "$SBX/watch_single_err"; then ok "single account: bypass warning message"; else bad "single account bypass" "$(cat "$SBX/watch_single_err")"; fi
 )
 
 echo "== watch: end-to-end handoff =="
@@ -664,6 +664,251 @@ JSON
 FAKE_EXIT=42 "$CR" --watch --account work x >/dev/null 2>"$SBX/stderr"; rc=$?
 eq "watch: natural child exit code propagates" "$rc" "42"
 if grep -q '↻' "$SBX/stderr"; then bad "watch: no handoff on natural exit" "unexpected handoff banner"; else ok "watch: no handoff on natural exit"; fi
+
+echo "== api: rotation pool — explicit-only by default =="
+(
+  export CR_HOME="$SBX/api_pool_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"work","kind":"subscription","configDir":"$SBX/api_pool_home/accounts/work","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_pool_home/accounts/workkey","apiKey":"sk-test-work","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false},
+  {"name":"workkey2","kind":"api","configDir":"$SBX/api_pool_home/accounts/workkey2","apiKey":"sk-test-work2","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  pool="$(cr_enabled_accounts | tr '\n' ',')"
+  eq "api rotate=false excluded from pool" "$pool" "default,work,"
+  # workkey2 has no rotate field — also excluded (defaults to false/absent)
+  if printf '%s' "$pool" | grep -q 'workkey'; then bad "api rotate absent excluded from pool" "workkey in pool: $pool"; else ok "api rotate absent excluded from pool"; fi
+)
+# 4 launches via run_cr — workkey must never appear in route.log
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"work","kind":"subscription","configDir":"$CR_HOME/accounts/work","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$CR_HOME/accounts/workkey","apiKey":"sk-test-work","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+for i in 1 2 3 4; do run_cr -p x; done
+if grep -q 'workkey' "$CR_HOME/logs/route.log"; then bad "api explicit-only: never auto-selected" "workkey in route.log"; else ok "api explicit-only: never auto-selected"; fi
+
+echo "== api: rotate=true joins the pool =="
+(
+  export CR_HOME="$SBX/api_rotate_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"perskey","kind":"api","configDir":"$SBX/api_rotate_home/accounts/perskey","apiKey":"sk-pers","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  pool="$(cr_enabled_accounts | tr '\n' ',')"
+  eq "api rotate=true in enabled pool" "$pool" "default,perskey,"
+  avail="$(cr_available_accounts | tr '\n' ',')"
+  eq "api rotate=true in available pool (usagePct null)" "$avail" "default,perskey,"
+)
+
+echo "== api: rotate command toggles =="
+(
+  export CR_HOME="$SBX/api_toggle_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_toggle_home/accounts/workkey","apiKey":"sk-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # Toggle on
+  "$CR" rotate workkey on 2>/dev/null
+  got="$(jq -r '.accounts[]|select(.name=="workkey")|.rotate' "$CR_HOME/config.json")"
+  eq "rotate on: .rotate=true" "$got" "true"
+  # Toggle off
+  "$CR" rotate workkey off 2>/dev/null
+  got="$(jq -r '.accounts[]|select(.name=="workkey")|.rotate' "$CR_HOME/config.json")"
+  eq "rotate off: .rotate=false" "$got" "false"
+  # Rotating a subscription should exit nonzero
+  "$CR" rotate work on 2>/dev/null; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "rotate subscription: exits nonzero"; else bad "rotate subscription: exits nonzero" "rc=$rc"; fi
+)
+
+echo "== api: launch env =="
+(
+  export CR_HOME="$SBX/api_env_home"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/workkey"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_env_home/accounts/workkey","apiKey":"sk-api-launch-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # Richer fake that echoes all relevant env vars
+  cat > "$FAKEBIN/claude" <<'RICHEOF'
+#!/usr/bin/env bash
+{ echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "API_KEY=${ANTHROPIC_API_KEY-<unset>}"
+  echo "AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+  echo "BASE_URL=${ANTHROPIC_BASE_URL-<unset>}"
+  echo "ARGS=$*"; } > "$FAKE_OUT"
+exit "${FAKE_EXIT:-0}"
+RICHEOF
+  chmod +x "$FAKEBIN/claude"
+  export ANTHROPIC_AUTH_TOKEN="SHOULD_BE_SCRUBBED"
+  export CLAUDE_CODE_OAUTH_TOKEN="SHOULD_BE_SCRUBBED"
+  export ANTHROPIC_BASE_URL="http://evil"
+  run_cr --account workkey -p hi
+  out="$(cat "$FAKE_OUT")"
+  eq "api: CLAUDE_CONFIG_DIR set to account dir" \
+    "$(grep '^CONFIG_DIR=' <<<"$out")" "CONFIG_DIR=$SBX/api_env_home/accounts/workkey"
+  eq "api: ANTHROPIC_API_KEY set to seeded key" \
+    "$(grep '^API_KEY=' <<<"$out")" "API_KEY=sk-api-launch-test"
+  eq "api: ANTHROPIC_AUTH_TOKEN scrubbed" \
+    "$(grep '^AUTH_TOKEN=' <<<"$out")" "AUTH_TOKEN=<unset>"
+  eq "api: CLAUDE_CODE_OAUTH_TOKEN scrubbed" \
+    "$(grep '^OAUTH_TOKEN=' <<<"$out")" "OAUTH_TOKEN=<unset>"
+  eq "api: ANTHROPIC_BASE_URL scrubbed" \
+    "$(grep '^BASE_URL=' <<<"$out")" "BASE_URL=<unset>"
+  unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL
+  # Banner should contain "api" on stderr (run_cr captures stderr to $SBX/stderr)
+  run_cr --account workkey -p hi
+  if grep -q 'api' "$SBX/stderr"; then ok "api: banner contains 'api'"; else bad "api: banner contains 'api'" "$(cat "$SBX/stderr")"; fi
+  # Restore standard fake
+  cat > "$FAKEBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+{ echo "CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "API_KEY=${ANTHROPIC_API_KEY-<unset>}"
+  echo "AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+  echo "ARGS=$*"
+} > "$FAKE_OUT"
+exit "${FAKE_EXIT:-0}"
+EOF
+  chmod +x "$FAKEBIN/claude"
+)
+
+echo "== api: usage skips api accounts =="
+(
+  export CR_HOME="$SBX/api_usage_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_usage_home/accounts/workkey","apiKey":"sk-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # explicit usage for api account: exits 0, mentions no usage windows
+  "$CR" usage workkey 2>"$SBX/api_usage_err"; rc=$?
+  eq "api usage explicit: exits 0" "$rc" "0"
+  if grep -qiE 'api-key|no usage windows|pay-per-token' "$SBX/api_usage_err"; then ok "api usage explicit: notes no usage windows"; else bad "api usage explicit: no usage windows message" "$(cat "$SBX/api_usage_err")"; fi
+  # all-accounts cr usage must NOT warn-fail on workkey
+  "$CR" usage 2>"$SBX/api_usage_all_err" || true
+  if grep -q "usage poll failed for 'workkey'" "$SBX/api_usage_all_err"; then
+    bad "api usage all: no warn-fail for api account" "$(cat "$SBX/api_usage_all_err")"
+  else
+    ok "api usage all: no warn-fail for api account"
+  fi
+)
+
+echo "== api: list shows explicit-only =="
+(
+  export CR_HOME="$SBX/api_list_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_list_home/accounts/workkey","apiKey":"sk-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  list_out="$("$CR" list 2>&1)"
+  if grep -q 'explicit-only' <<<"$list_out"; then ok "list: api account shows explicit-only"; else bad "list: explicit-only not found" "$list_out"; fi
+  if grep -q 'workkey' <<<"$list_out" && grep -q ' api ' <<<"$list_out"; then ok "list: api account shows kind=api"; else bad "list: api kind not found" "$list_out"; fi
+)
+
+echo "== api: watch bypasses api accounts =="
+(
+  export CR_HOME="$SBX/api_watch_home"; mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/sub1" "$CR_HOME/accounts/sub2" "$CR_HOME/accounts/workkey"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"sub1","kind":"subscription","configDir":"$SBX/api_watch_home/accounts/sub1","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"sub2","kind":"subscription","configDir":"$SBX/api_watch_home/accounts/sub2","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_watch_home/accounts/workkey","apiKey":"sk-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  "$CR" --watch --account workkey -p x 2>"$SBX/api_watch_err"
+  if grep -q 'without watch' "$SBX/api_watch_err"; then ok "watch: api account bypasses watch"; else bad "watch: api account bypass message" "$(cat "$SBX/api_watch_err")"; fi
+  got_args="$(grep '^ARGS=' "$FAKE_OUT" 2>/dev/null || true)"
+  eq "watch bypassed: args forwarded normally" "$got_args" "ARGS=-p x"
+)
+
+echo "== api: session ownership + adopt =="
+(
+  export CR_HOME="$SBX/api_own_home"
+  mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/sub1/projects/-p" "$CR_HOME/accounts/apikey"
+  source "$CR_REPO/lib/common.sh"
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"sub1","kind":"subscription","configDir":"$CR_HOME/accounts/sub1","lastUsed":0,"enabled":true},
+  {"name":"apikey","kind":"api","configDir":"$CR_HOME/accounts/apikey","apiKey":"sk-test","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":false}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  # Pull in cr_account_owning_session from cr
+  eval "$(sed -n '/^cr_account_owning_session()/,/^}/p' "$CR_REPO/cr")"
+  SID_API="a1b2c3d4-0000-0000-0000-000000000000"
+  echo '{"api":1}' > "$CR_HOME/accounts/sub1/projects/-p/$SID_API.jsonl"
+  eq "api: owning session finds sub1 (real file)" "$(cr_account_owning_session "$SID_API")" "sub1"
+
+  # Adopt into an api account — should succeed
+  mkdir -p "$CR_HOME/accounts/apikey/projects/-p"
+  eval "$(sed -n '/^cr_link_session()/,/^}/p' "$CR_REPO/cr")"
+  cr_link_session "$SID_API" apikey >/dev/null 2>&1
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then ok "api: cr_link_session into api account succeeds"; else bad "api: link_session into api account" "rc=$rc"; fi
+  link="$CR_HOME/accounts/apikey/projects/-p/$SID_API.jsonl"
+  if [[ -L "$link" ]]; then ok "api: adopt creates symlink in api account dir"; else bad "api: adopt symlink not created" "$link"; fi
+
+  # cr adopt via CLI: api account should be accepted
+  "$CR" adopt "$SID_API" apikey 2>"$SBX/api_adopt_err"; rc=$?
+  if [[ "$rc" -eq 0 ]]; then ok "api: cr adopt accepts api account target"; else bad "api: cr adopt api target" "rc=$rc: $(cat "$SBX/api_adopt_err")"; fi
+)
+
+echo "== api: usage-aware never picks a non-rotating api account =="
+(
+  export CR_HOME="$SBX/api_ua_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  # Base config: subscription "sub1" usagePct 80, api "workkey" rotate ABSENT usagePct 5
+  # (deliberately poisoned cache), api "offkey" rotate:false usagePct 1, backend "deepseek" usagePct 2.
+  cat > "$CR_CONFIG" <<JSON
+{"selection":"usage-aware","accounts":[
+  {"name":"sub1","kind":"subscription","configDir":null,"lastUsed":0,"enabled":true,"usagePct":80},
+  {"name":"workkey","kind":"api","configDir":"$SBX/api_ua_home/accounts/workkey","apiKey":"sk-w","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":5},
+  {"name":"offkey","kind":"api","configDir":"$SBX/api_ua_home/accounts/offkey","apiKey":"sk-o","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":1,"rotate":false},
+  {"name":"deepseek","kind":"backend","configDir":null,"baseUrl":"https://api.deepseek.com/anthropic","model":"m","email":null,"plan":"backend","lastUsed":0,"enabled":true,"usagePct":2}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  got="$(cr_select_usage_aware)"
+  eq "usage-aware: only subscription sub1 eligible → sub1 picked" "$got" "sub1"
+
+  # Second case: add perskey rotate:true usagePct 5 — now it should be picked (lower pct than sub1=80).
+  cr_config_update '.accounts += [{"name":"perskey","kind":"api","configDir":"'"$SBX/api_ua_home/accounts/perskey"'","apiKey":"sk-p","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":5,"rotate":true}]' >/dev/null
+  got2="$(cr_select_usage_aware)"
+  eq "usage-aware: rotate=true api perskey (pct 5) beats sub1 (pct 80)" "$got2" "perskey"
+)
+
+echo "== watch: bypass counts subscriptions only =="
+(
+  export CR_HOME="$SBX/api_watch_bypass_home"
+  mkdir -p "$CR_HOME/logs" "$CR_HOME/accounts/sub1" "$CR_HOME/accounts/rotkey"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"sub1","kind":"subscription","configDir":"$SBX/api_watch_bypass_home/accounts/sub1","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"rotkey","kind":"api","configDir":"$SBX/api_watch_bypass_home/accounts/rotkey","apiKey":"sk-r","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":true}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  "$CR_REPO/cr" --watch --account sub1 x >"$SBX/stdout" 2>"$SBX/api_watch_bypass_err"
+  if grep -qE 'fewer than two subscription|nothing to hand off' "$SBX/api_watch_bypass_err"; then
+    ok "watch bypass: 1 subscription + 1 rotate=true api → bypass warning"
+  else
+    bad "watch bypass: expected bypass warning" "$(cat "$SBX/api_watch_bypass_err")"
+  fi
+)
 
 echo
 PASS=$(wc -c < "$SBX/.pass" | tr -d ' '); FAIL=$(wc -c < "$SBX/.fail" | tr -d ' ')

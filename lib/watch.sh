@@ -71,7 +71,7 @@ cr_watch_latest_session() {
         best_path="$f"
       fi
     done
-  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription")|.name')
+  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
 
   if [[ -z "$best_sid" ]]; then
     return 1
@@ -103,6 +103,8 @@ cr_watch_idle() {
 
 # Echo the name of the best handoff candidate (an enabled subscription account
 # other than current_account with usagePct < at_pct), or nothing if none qualifies.
+# api accounts are deliberately excluded from watch handoffs — they are
+# pay-per-token (no usage windows) and must never be auto-selected.
 cr_watch_pick_next() {
   local current_account="$1" at_pct="$2"
   cr_config_read | jq -r --arg cur "$current_account" --argjson at "$at_pct" '
@@ -170,6 +172,7 @@ cr_watch_watcher() {
     fi
 
     # Poll all other enabled subscription accounts (best-effort).
+    # api accounts are deliberately excluded — pay-per-token, no usage endpoint.
     if [[ -z "${CR_NO_USAGE_POLL:-}" ]]; then
       local other
       while IFS= read -r other; do

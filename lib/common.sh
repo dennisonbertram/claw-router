@@ -128,19 +128,31 @@ cr_account_exists() {
   cr_config_read | jq -e --arg n "$1" '.accounts | any(.name==$n)' >/dev/null 2>&1
 }
 
-# Echo an account's kind: "subscription" (default) or "backend".
+# Echo an account's kind: "subscription" (default), "backend", or "api".
 cr_account_kind() {
   cr_config_read | jq -r --arg n "$1" '
     .accounts[] | select(.name==$n) | (.kind // "subscription")'
 }
 
-# List enabled *subscription* account names — the pool that rotation draws from.
-# Backends are excluded by design: they are an inferior fallback, reached only
-# by explicit `cr --account <name>` / `cr@<name>`.
-cr_enabled_accounts() {
+# List enabled *subscription-only* account names — used for usage polling.
+# api accounts have no OAuth usage endpoint; backends are explicit-only.
+cr_subscription_accounts() {
   cr_config_read | jq -r '.accounts[]
     | select(.enabled != false)
     | select((.kind // "subscription") == "subscription")
+    | .name'
+}
+
+# List enabled accounts in the rotation pool: subscriptions + api accounts
+# with .rotate==true. Backends are always excluded (explicit-only).
+# api accounts with rotate==false (the safety default) are also excluded.
+cr_enabled_accounts() {
+  cr_config_read | jq -r '.accounts[]
+    | select(.enabled != false)
+    | select(
+        ((.kind // "subscription") == "subscription")
+        or ((.kind == "api") and (.rotate == true))
+      )
     | .name'
 }
 
@@ -198,16 +210,20 @@ cr_exhausted_threshold() {
   cr_config_read | jq -r '.exhaustedAtPct // 100'
 }
 
-# Enabled subscription accounts that are NOT out of usage (per cached usagePct).
-# This is the pool round-robin / lru / random actually draw from. If EVERY
-# account is exhausted, this prints nothing — callers fall back to all enabled
-# rather than hard-failing.
+# Enabled accounts (subscriptions + rotate=true api accounts) that are NOT out
+# of usage (per cached usagePct). This is the pool round-robin / lru / random
+# actually draw from. If EVERY account is exhausted, this prints nothing —
+# callers fall back to all enabled rather than hard-failing.
+# api accounts have usagePct=null (pay-per-token) → always count as available.
 cr_available_accounts() {
   local thr; thr="$(cr_exhausted_threshold)"
   cr_config_read | jq -r --argjson t "$thr" '
     .accounts[]
     | select(.enabled != false)
-    | select((.kind // "subscription") == "subscription")
+    | select(
+        ((.kind // "subscription") == "subscription")
+        or ((.kind == "api") and (.rotate == true))
+      )
     | select((.usagePct == null) or (.usagePct < $t))
     | .name'
 }
@@ -255,12 +271,18 @@ cr_select_random() {
   printf '%s' "${pool[$(( RANDOM % n ))]}"
 }
 
-# usage-aware: pick enabled account with most remaining headroom from the
-# cached usage figure (.usagePct, lower = more free). Falls back to lru.
+# usage-aware: pick the rotation-pool account with most remaining headroom from
+# the cached usage figure (.usagePct, lower = more free). Draws from the same
+# rotation pool as round-robin/lru/random (subscriptions + rotate=true api
+# accounts; backends and rotate=false api accounts are never considered).
+# Falls back to lru when no rotation-pool account has a cached usagePct.
 cr_select_usage_aware() {
   local name
   name="$(cr_config_read | jq -r '
-    [.accounts[] | select(.enabled != false) | select(.usagePct != null)]
+    [.accounts[]
+     | select(.enabled != false)
+     | select(((.kind // "subscription") == "subscription") or ((.kind == "api") and (.rotate == true)))
+     | select(.usagePct != null)]
     | sort_by(.usagePct) | .[0].name // empty')"
   if [[ -n "$name" ]]; then printf '%s' "$name"; else cr_select_lru; fi
 }

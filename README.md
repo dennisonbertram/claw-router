@@ -112,6 +112,8 @@ Manage (never forwarded to claude):
 |---|---|
 | `cr add <name>` | make an account dir, symlink shared settings, browser-login, cache identity |
 | `cr add-backend <name> …` | register an alt-model endpoint (e.g. DeepSeek); see Backends below |
+| `cr add-api <name>` | register an Anthropic API key account (explicit-only by default) |
+| `cr rotate <name> on\|off` | opt an api-key account in or out of rotation |
 | `cr register-default [name]` | register the existing `~/.claude` login (no dir move) |
 | `cr login <name>` / `cr logout <name>` | (re)auth / sign out an account |
 | `cr remove <name>` | unregister (prints how to delete its dir + keychain item) |
@@ -163,6 +165,39 @@ usage left per window  (█ = available)
 
 Bars are colored green/yellow/red by headroom. `cr usage --plain` prints a
 single line per account instead.
+
+## API-key accounts
+
+Run Claude Code billed directly to an Anthropic API key, with its own config dir and conversation history — completely separate from your subscription accounts.
+
+> **API-key accounts are explicit-only by default. A plain `cr` will never auto-pick one.** This is intentional: if you have a work API key, it must not bleed into personal projects. You reach an api account by naming it directly, or by explicitly opting it into rotation.
+
+Register one:
+
+```sh
+cr add-api work-key                   # prompt for key (hidden input)
+cr add-api work-key --from-env        # copy from $ANTHROPIC_API_KEY
+cr add-api personal-key --rotate      # opt into rotation at registration time
+```
+
+Opt an existing account in or out of rotation:
+
+```sh
+cr rotate personal-key on             # plain 'cr' may now pick it
+cr rotate personal-key off            # back to explicit-only
+cr rotate personal-key                # print current state
+```
+
+Use it:
+
+```sh
+cr@work-key -p "draft the proposal"  # always explicit — never auto-selected
+cr@personal-key                      # interactive session under that key
+```
+
+How it works: `cr` exports `ANTHROPIC_API_KEY` and sets `CLAUDE_CONFIG_DIR` to the account's own directory (history, projects, and settings all live there). It scrubs `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_BASE_URL` so no conflicting auth leaks through.
+
+**No usage meters.** API-key accounts are pay-per-token; there are no usage windows to poll. `cr usage work-key` prints a short note instead of a meter, and the all-accounts `cr usage` silently skips api accounts. Watch-mode handoffs never target api accounts for the same reason.
 
 ## Backends (alternate models, e.g. DeepSeek)
 

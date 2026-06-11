@@ -101,7 +101,7 @@ cr_account_owning_session() {
       # Real file only: exists, is a regular file, and is NOT a symlink.
       if [[ -f "$f" && ! -L "$f" ]]; then printf '%s' "$name"; return 0; fi
     done
-  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription")|.name')
+  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
   return 1
 }
 
@@ -157,6 +157,14 @@ cr_launch() {
     return
   fi
 
+  if [[ "$kind" == "api" ]]; then
+    if [[ "${CR_WATCH:-0}" == 1 ]]; then
+      cr_warn "watch: api-key accounts have no usage windows — running without watch"
+    fi
+    cr_launch_api "$account" "$forced" "$@"
+    return
+  fi
+
   # --- subscription account ------------------------------------------------
   local dir; dir="$(cr_account_dir "$account")" || cr_die "cannot resolve dir for '$account'"
 
@@ -189,9 +197,9 @@ cr_launch() {
     done
   fi
   if [[ "${CR_WATCH:-0}" == 1 ]]; then
-    local _naccts; _naccts="$(cr_enabled_accounts | grep -c . || true)"
-    if [[ "$_naccts" -lt 2 ]]; then
-      cr_warn "watch: only one account — nothing to hand off to"
+    local _nsubs; _nsubs="$(cr_subscription_accounts | grep -c . || true)"
+    if [[ "$_nsubs" -lt 2 ]]; then
+      cr_warn "watch: fewer than two subscription accounts — nothing to hand off to"
       CR_WATCH=0
     fi
   fi
@@ -243,6 +251,34 @@ cr_launch_backend() {
 
   cr_build_exec
   if [[ -n "$model" ]]; then exec "${CR_EXEC[@]}" --model "$model" "$@"; else exec "${CR_EXEC[@]}" "$@"; fi
+}
+
+# Launch an API-key account (Anthropic API key, own config dir).
+# Auth via ANTHROPIC_API_KEY; conflicting OAuth vars are scrubbed.
+cr_launch_api() {
+  local account="$1"; shift
+  local forced="$1"; shift
+
+  local dir key
+  dir="$(cr_account_dir "$account")" || cr_die "cannot resolve dir for '$account'"
+  key="$(cr_backend_key "$account")" || cr_die "no API key for '$account' (re-run: cr add-api $account)"
+
+  # Scrub any OAuth / conflicting env vars; set the API key + config dir.
+  unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL
+  export ANTHROPIC_API_KEY="$key"
+  if [[ -n "$dir" ]]; then export CLAUDE_CONFIG_DIR="$dir"; else unset CLAUDE_CONFIG_DIR; fi
+
+  local rotate
+  rotate="$(cr_config_read | jq -r --arg n "$account" '.accounts[]|select(.name==$n)|.rotate // false')"
+
+  printf '%s◆%s %s%s%s %s(api key)%s %s· %s%s\n' \
+    "$C_CYAN" "$C_RESET" "$C_BOLD" "$account" "$C_RESET" \
+    "$C_GREY" "$C_RESET" \
+    "$C_DIM" "$([[ -n "$forced" || "$rotate" != "true" ]] && echo "explicit" || echo "rotation")" "$C_RESET" >&2
+  printf '%s\t%s\tapi:%s\n' "$(date -u +%FT%TZ)" "$account" "$account" >> "$CR_LOG" 2>/dev/null || true
+
+  cr_build_exec
+  exec "${CR_EXEC[@]}" "$@"
 }
 
 # ------------------------------------------------------------------------
@@ -342,6 +378,112 @@ cr_cmd_add_backend() {
   cr_say "It is NOT in rotation. Use it explicitly:  cr@$name [--model pro|flash] [claude args...]"
 }
 
+# Register an Anthropic API-key account.
+# Explicit-only by default (rotate=false) — plain 'cr' will NEVER auto-pick it.
+# Use --rotate to opt into rotation, --from-env to read $ANTHROPIC_API_KEY,
+# or --key <k> to supply inline (note: ends up in shell history).
+#   cr add-api <name> [--rotate] [--from-env] [--key <key>]
+cr_cmd_add_api() {
+  local name="${1:-}"; shift || true
+  [[ -z "$name" ]] && cr_die "usage: cr add-api <name> [--rotate] [--from-env] [--key <key>]"
+  cr_ensure_home
+  cr_account_exists "$name" && cr_die "account '$name' already exists"
+
+  local rotate=false key="" from_env=0
+  while (($#)); do
+    case "$1" in
+      --rotate)    rotate=true; shift ;;
+      --from-env)  from_env=1; shift ;;
+      --key)       key="${2:?--key needs a value}"; shift 2 ;;
+      *) cr_die "add-api: unknown flag '$1'" ;;
+    esac
+  done
+
+  # Obtain the key.
+  if [[ "$from_env" -eq 1 ]]; then
+    [[ -z "${ANTHROPIC_API_KEY:-}" ]] && cr_die "ANTHROPIC_API_KEY is not set"
+    key="$ANTHROPIC_API_KEY"
+    cr_say "Using key from \$ANTHROPIC_API_KEY."
+  elif [[ -z "$key" ]]; then
+    printf 'Enter Anthropic API key for "%s" (input hidden): ' "$name" >&2
+    read -rs key; printf '\n' >&2
+    [[ -z "$key" ]] && cr_die "no key entered"
+  fi
+
+  local dir="${CR_ACCOUNTS_DIR}/${name}"
+  mkdir -p "$dir"
+
+  # Symlink shared bits from ~/.claude.
+  local p src
+  for p in "${CR_SHARE_PATHS[@]}"; do
+    src="${HOME}/.claude/${p}"
+    if [[ -e "$src" && ! -e "${dir}/${p}" ]]; then
+      ln -s "$src" "${dir}/${p}" 2>/dev/null || cr_warn "could not symlink $p"
+    fi
+  done
+
+  # Store key in keychain (macOS) or plaintext fallback.
+  local stored="keychain"
+  if cr_have security; then
+    security add-generic-password -U -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" -w "$key" 2>/dev/null \
+      || cr_die "failed to store key in keychain"
+  else
+    stored="config"
+  fi
+
+  cr_config_update '.accounts += [{
+      name:$n, kind:"api", configDir:$d,
+      email:null, plan:"api-key", lastUsed:0, enabled:true, usagePct:null,
+      rotate:($r=="true"),
+      apiKey:(if $store=="config" then $k else null end) }]' \
+    --arg n "$name" --arg d "$dir" --arg r "$rotate" \
+    --arg store "$stored" --arg k "$key"
+
+  if [[ "$rotate" == "true" ]]; then
+    cr_say "Added api-key account '$name' (key in $stored). It IS in rotation — a plain 'cr' may pick it."
+    cr_say "Use it explicitly with: cr@$name …  (opt out with: cr rotate $name off)"
+  else
+    cr_say "Added api-key account '$name' (key in $stored). It is EXPLICIT-ONLY — a plain 'cr' will never pick it."
+    cr_say "Use it with: cr@$name …  (opt into rotation: cr rotate $name on)"
+  fi
+}
+
+# Toggle .rotate for a kind=api account.
+#   cr rotate <name> on|off   — set
+#   cr rotate <name>          — print current state
+cr_cmd_rotate() {
+  local name="${1:-}" state="${2:-}"
+  [[ -z "$name" ]] && cr_die "usage: cr rotate <name> [on|off]"
+  cr_ensure_home
+  cr_account_exists "$name" || cr_die "unknown account: $name"
+  local kind; kind="$(cr_account_kind "$name")"
+  if [[ "$kind" == "subscription" ]]; then
+    cr_die "'$name' is a subscription account — subscriptions are always in rotation (use 'cr use' to pin or 'cr policy' to change strategy)"
+  fi
+  if [[ "$kind" == "backend" ]]; then
+    cr_die "'$name' is a backend — backends are always explicit-only and cannot join rotation"
+  fi
+  # kind == "api"
+  if [[ -z "$state" ]]; then
+    local cur; cur="$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.rotate // false')"
+    if [[ "$cur" == "true" ]]; then
+      cr_say "$name: rotate=on (in rotation)"
+    else
+      cr_say "$name: rotate=off (explicit-only)"
+    fi
+    return 0
+  fi
+  case "$state" in
+    on)
+      cr_config_update '(.accounts[] | select(.name==$n) | .rotate) = true' --arg n "$name"
+      cr_say "$name: rotation ON — a plain 'cr' may now pick this account." ;;
+    off)
+      cr_config_update '(.accounts[] | select(.name==$n) | .rotate) = false' --arg n "$name"
+      cr_say "$name: rotation OFF — use cr@$name to reach it explicitly." ;;
+    *) cr_die "usage: cr rotate <name> on|off" ;;
+  esac
+}
+
 # Register the existing ~/.claude login as an account (default has no dir).
 cr_cmd_register_default() {
   local name="${1:-default}"
@@ -387,6 +529,15 @@ cr_cmd_remove() {
     if cr_have security && security find-generic-password -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" >/dev/null 2>&1; then
       cr_say "Its API key is still in your keychain. Remove it with:"
       cr_say "  security delete-generic-password -s '$CR_BACKEND_KEYCHAIN_SVC' -a '$name'"
+    fi
+  elif [[ "$kind" == "api" ]]; then
+    if cr_have security && security find-generic-password -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" >/dev/null 2>&1; then
+      cr_say "Its API key is still in your keychain. Remove it with:"
+      cr_say "  security delete-generic-password -s '$CR_BACKEND_KEYCHAIN_SVC' -a '$name'"
+    fi
+    if [[ -n "$dir" && -d "$dir" ]]; then
+      cr_say "Its config dir still exists: $dir"
+      cr_say "  Remove it with:  rm -rf '$dir'"
     fi
   elif [[ -n "$dir" && -d "$dir" ]]; then
     cr_say "Its config dir still exists: $dir"
@@ -483,12 +634,18 @@ cr_cmd_list() {
       ( (.kind // "subscription") ) as $k |
       [ (if .name==$PIN then "★ "+.name else .name end),
         $k,
-        (if $k=="backend" then (.baseUrl // "?" | sub("^https?://";"")) else (.email // "?") end),
-        (if $k=="backend" then (.model // "?") else (.plan // "?") end),
+        (if $k=="backend" then (.baseUrl // "?" | sub("^https?://";""))
+         elif $k=="api" then "(api key)"
+         else (.email // "?") end),
+        (if $k=="backend" then (.model // "?")
+         elif $k=="api" then "api-key"
+         else (.plan // "?") end),
         (if (.lastUsed // 0) == 0 then "never" else (.lastUsed/1000 | strftime("%Y-%m-%d %H:%M")) end),
         (if .usagePct == null then "-" else "\(.usagePct|floor)%" end),
         (if .enabled == false then "no" else "yes" end),
-        (if $k=="backend" then "explicit-only" else "yes" end)
+        (if $k=="backend" then "explicit-only"
+         elif $k=="api" then (if .rotate == true then "yes" else "explicit-only" end)
+         else "yes" end)
       ] | @tsv)' | column -t -s $'\t')"
 
   printf '\n' >&2
@@ -498,6 +655,8 @@ cr_cmd_list() {
       printf '  %s%s%s\n' "$C_BOLD" "$line" "$C_RESET" >&2; first=0
     elif [[ "$line" == *"backend"* ]]; then
       printf '  %s%s%s\n' "$C_YELLOW" "$line" "$C_RESET" >&2
+    elif [[ "$line" == *" api "* ]]; then
+      printf '  %s%s%s\n' "$C_CYAN" "$line" "$C_RESET" >&2
     elif [[ "$line" == "★ "* ]]; then
       printf '  %s%s%s\n' "$C_BOLD" "$line" "$C_RESET" >&2
     else
@@ -511,15 +670,28 @@ cr_cmd_list() {
 cr_cmd_usage() {
   cr_ensure_home
   cr_require_deps
-  cr_have curl || cr_die "cr usage needs curl"
   local plain=0
   if [[ "${1:-}" == "--plain" ]]; then plain=1; shift; fi
   local name="${1:-}"
   [[ -n "$name" ]] && { cr_account_exists "$name" || cr_die "unknown account: $name"; }
 
+  # api-key accounts have no usage windows — handle before any curl requirement.
+  if [[ -n "$name" ]]; then
+    local kind; kind="$(cr_account_kind "$name" 2>/dev/null || true)"
+    if [[ "$kind" == "api" ]]; then
+      cr_say "$name: api-key account — pay-per-token, no usage windows"
+      return 0
+    fi
+  fi
+
+  cr_have curl || cr_die "cr usage needs curl"
+
   if [[ "$plain" -eq 1 ]]; then
-    if [[ -n "$name" ]]; then cr_poll_account "$name" >&2
-    else local a; while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_enabled_accounts); fi
+    if [[ -n "$name" ]]; then
+      cr_poll_account "$name" >&2
+    else
+      local a; while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_subscription_accounts)
+    fi
   else
     cr_render_meters "$name"
   fi
@@ -582,7 +754,7 @@ cr_cmd_adopt() {
   [[ -z "$sid" || -z "$target" ]] && cr_die "usage: cr adopt <session-id> <target-account>"
   cr_ensure_home
   cr_account_exists "$target" || cr_die "unknown target account: $target"
-  [[ "$(cr_account_kind "$target")" == "backend" ]] && cr_die "backends don't store sessions; pick a subscription account"
+  [[ "$(cr_account_kind "$target")" == "backend" ]] && cr_die "backends don't store sessions; pick a subscription or api account"
 
   cr_link_session "$sid" "$target"
   case $? in
@@ -599,7 +771,7 @@ cr_cmd_status() {
   if [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]]; then
     if cr_have curl; then
       cr_say "${C_DIM}refreshing usage…${C_RESET}"
-      local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_enabled_accounts)
+      local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_subscription_accounts)
     else
       cr_warn "curl not found — showing cached usage"
     fi
@@ -638,11 +810,20 @@ cr_doctor() {
   local name="${1:-}"
   local check
   check() {
-    local a dir svc kc
+    local a dir svc kc kind
     a="$1"
-    if [[ "$(cr_account_kind "$a")" == "backend" ]]; then
+    kind="$(cr_account_kind "$a")"
+    if [[ "$kind" == "backend" ]]; then
       if cr_backend_key "$a" >/dev/null 2>&1; then kc="ok"; else kc="MISSING (re-run: cr add-backend)"; fi
       cr_say "  $a: backend  key=$kc  (explicit-only, not in rotation)"
+      return
+    fi
+    if [[ "$kind" == "api" ]]; then
+      dir="$(cr_account_dir "$a" 2>/dev/null || true)"
+      if cr_backend_key "$a" >/dev/null 2>&1; then kc="ok"; else kc="MISSING (re-run: cr add-api $a)"; fi
+      local rot; rot="$(cr_config_read | jq -r --arg n "$a" '.accounts[]|select(.name==$n)|.rotate // false')"
+      local rot_note; [[ "$rot" == "true" ]] && rot_note="in rotation" || rot_note="explicit-only"
+      cr_say "  $a: api  dir=${dir:-(none)}  key=$kc  ($rot_note)"
       return
     fi
     dir="$(cr_account_dir "$a")"
@@ -682,6 +863,8 @@ cr_cmd_help() {
   head "Accounts"
   cmd "cr add <name>"              "browser-login a subscription, cache identity"
   cmd "cr add-backend <name> ..."    "register an alt-model endpoint (e.g. DeepSeek)"
+  cmd "cr add-api <name>"          "register an Anthropic API key (explicit-only by default)"
+  cmd "cr rotate <name> on|off"    "opt an api-key account in/out of rotation"
   cmd "cr register-default [name]" "adopt your existing ~/.claude login"
   cmd "cr login / logout <name>"   "(re)authenticate / sign out an account"
   cmd "cr remove <name>"           "unregister an account"
@@ -713,6 +896,7 @@ cr_cmd_help() {
   ex "cr --dangerously-skip-permissions" "any claude flag is forwarded as-is"
   ex 'cr@work -p "draft the PR"'     "force the 'work' subscription"
   ex 'cr@deepseek --model flash ...'   "use a backend (DeepSeek), explicit only"
+  ex 'cr@work-key -p "…"'             "use an API key, billed per token (never auto-picked)"
   ex "cr policy usage-aware && cr usage" "route to whichever has most headroom"
 
   printf '\n%s  Plain %scr%s%s rotates over subscriptions only — backends are explicit-only (%scr@<name>%s%s).%s\n' \
@@ -767,6 +951,8 @@ main() {
   case "${1:-}" in
     add)              shift; cr_cmd_add "$@" ;;
     add-backend)      shift; cr_cmd_add_backend "$@" ;;
+    add-api)          shift; cr_cmd_add_api "$@" ;;
+    rotate)           shift; cr_cmd_rotate "$@" ;;
     register-default) shift; cr_cmd_register_default "$@" ;;
     login)            shift; cr_cmd_login "$@" ;;
     logout)           shift; cr_cmd_logout "$@" ;;
