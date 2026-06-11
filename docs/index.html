@@ -213,6 +213,36 @@ cr config auto-refresh off  <span class="c"># don't auto-poll before routing</sp
 cr config ttl 600           <span class="c"># cached usage goes stale after 10 min</span></code></pre>
       </div>
     </li>
+
+    <li class="stage" id="stage-handoff">
+      <hr class="stage__rule" aria-hidden="true">
+      <h2><span class="stage__num">6.0</span>The handoff.</h2>
+      <div class="prose">
+        <p>Routing well at launch still leaves one wall: the account you’re <em>on</em> can run dry mid-session. Add <code>--watch</code> (or <code>-w</code>) and <code>cr</code> stays at the helm — a background watcher polls usage, and when the account in use crosses the threshold (90% by default) while another has headroom, it waits for a quiet moment, then restarts Claude&nbsp;Code under the fresher account with <code>--resume</code>. The conversation follows; you lose a few seconds of restart, not your context.</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">console</span>
+        </div>
+        <pre><code>$ cr --watch
+<span class="a">◆ work</span>  you@work.com  (claude_max) · round-robin
+<span class="o">…hours pass…</span>
+<span class="a">↻ work at 93%</span> — continuing on personal (resuming 5fe702a8…)
+<span class="s">◆ personal</span>  you@gmail.com  (claude_max) · watch
+<span class="o">…same conversation, fresher account…</span></code></pre>
+      </div>
+      <div class="prose">
+        <p>Honest fine print: a reply can’t be handed off mid-stream — the watcher waits until the session has been idle for a beat (30&nbsp;seconds by default) before it moves. Tune all three knobs:</p>
+      </div>
+      <div class="codeblock">
+        <div class="codeblock__bar">
+          <span class="codeblock__label">sh</span>
+        </div>
+        <pre><code>cr config watch-at 90        <span class="c"># hand off when the account hits 90% used</span>
+cr config watch-interval 120 <span class="c"># poll usage every 2 minutes</span>
+cr config watch-idle 30      <span class="c"># only move after 30s of quiet</span></code></pre>
+      </div>
+    </li>
   </ol>
 
   <section class="reference" id="reference">
@@ -225,6 +255,7 @@ cr config ttl 600           <span class="c"># cached usage goes stale after 10 m
         <tbody>
           <tr><th scope="row">cr [args…]</th><td>Route by policy, then run <code>claude</code> with your args.</td></tr>
           <tr><th scope="row">cr@&lt;name&gt; [args…]</th><td>Force an account — shorthand for <code>--account &lt;name&gt;</code>.</td></tr>
+          <tr><th scope="row">cr --watch · -w</th><td>Stay aboard; auto-handoff to a fresher account near the limit.</td></tr>
           <tr><th scope="row">cr --sandbox · -s</th><td>Run the session inside a <code>cco</code> container.</td></tr>
           <tr><th scope="row">cr … -- [args…]</th><td><code>--</code> ends <code>cr</code>’s flags; everything after belongs to <code>claude</code>.</td></tr>
         </tbody>
@@ -238,9 +269,12 @@ cr config ttl 600           <span class="c"># cached usage goes stale after 10 m
           <tr><th scope="row">cr list</th><td>Every account: email, plan, last used, usage, enabled.</td></tr>
           <tr><th scope="row">cr use &lt;name&gt; · unuse</th><td>Pin the rotation to one account, or release it.</td></tr>
           <tr><th scope="row">cr policy &lt;p&gt;</th><td><code>round-robin</code> · <code>lru</code> · <code>random</code> · <code>usage-aware</code>.</td></tr>
+          <tr><th scope="row">cr config [key val]</th><td>Tune the knobs: <code>exhausted-at</code>, <code>ttl</code>, <code>auto-refresh</code>, <code>watch-at</code>, <code>watch-interval</code>, <code>watch-idle</code>.</td></tr>
           <tr><th scope="row">cr usage [name]</th><td>Per-window meters with reset countdowns.</td></tr>
           <tr><th scope="row">cr status [--refresh]</th><td>Dashboard: next pick, plus per-account usage bars.</td></tr>
           <tr><th scope="row">cr doctor [name]</th><td>Verify each account’s directory and Keychain credential.</td></tr>
+          <tr><th scope="row">cr add-api &lt;name&gt;</th><td>Register an Anthropic API key — explicit-only by default.</td></tr>
+          <tr><th scope="row">cr rotate &lt;name&gt; on·off</th><td>Opt an api-key account in or out of the rotation.</td></tr>
           <tr><th scope="row">cr add-backend &lt;name&gt;</th><td>Register an alt-model endpoint, e.g. DeepSeek.</td></tr>
           <tr><th scope="row">cr adopt &lt;id&gt; &lt;account&gt;</th><td>Link a session into another account ahead of time.</td></tr>
           <tr><th scope="row">cr login · logout · remove</th><td>Re-auth, sign out, or unregister an account.</td></tr>
@@ -252,12 +286,19 @@ cr config ttl 600           <span class="c"># cached usage goes stale after 10 m
   <section class="aboard" id="aboard">
     <div class="aboard__inner">
       <h2 class="section-head">Also aboard.</h2>
-      <p class="section-sub">Three more things the router carries, for the days you need them.</p>
+      <p class="section-sub">Four more things the router carries, for the days you need them.</p>
+
+      <div class="aboard-row">
+        <h3>An API key, on a leash.<small>cr add-api work-key</small></h3>
+        <div>
+          <p>Register an Anthropic API key as an account of its own — separate directory, separate history, billed per token. <strong>Explicit-only by default:</strong> a plain <code>cr</code> never picks it, so a work key can’t bleed into personal projects. Reach it by name — <code>cr@work-key</code> — or opt a personal key into the rotation with <code>cr rotate personal-key on</code>. API keys have no usage windows, so they’re excluded from the meters and never a <code>--watch</code> handoff target.</p>
+        </div>
+      </div>
 
       <div class="aboard-row">
         <h3>Backends, explicit-only.<small>cr add-backend deepseek</small></h3>
         <div>
-          <p><code>cr</code> can point Claude&nbsp;Code at any Anthropic-compatible endpoint — DeepSeek, say — registered as a <em>backend</em> account. Backends are never in the rotation: a plain <code>cr</code> only ever picks your subscriptions. You reach one by naming it — <code>cr@deepseek</code> — so an inferior fallback model stays out of your flow until you ask for it.</p>
+          <p><code>cr</code> can point Claude&nbsp;Code at any Anthropic-compatible endpoint — DeepSeek, say — registered as a <em>backend</em> account. Backends are never in the rotation: a plain <code>cr</code> sticks to your rotation pool. You reach one by naming it — <code>cr@deepseek</code> — so an inferior fallback model stays out of your flow until you ask for it.</p>
         </div>
       </div>
 
