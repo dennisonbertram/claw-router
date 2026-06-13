@@ -1272,7 +1272,18 @@ FAKECR
   # Use real jq.
   MB_JQ="$(command -v jq)"
 
-  plugin_out="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" CLAWROUTER_NOTIFY=0 \
+  # Fake launchctl that reports the agent as loaded (print succeeds).
+  MB_LC_DIR="$SBX/mb_lc_bin"; mkdir -p "$MB_LC_DIR"
+  cat > "$MB_LC_DIR/launchctl" <<'MBLC'
+#!/usr/bin/env bash
+# Always succeed — agent appears loaded for this render test.
+exit 0
+MBLC
+  chmod +x "$MB_LC_DIR/launchctl"
+  MB_LC="$MB_LC_DIR/launchctl"
+
+  plugin_out="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" \
+    CLAWROUTER_LAUNCHCTL="$MB_LC" CLAWROUTER_NOTIFY=0 \
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"; rc=$?
 
   eq "menubar: exits 0 with good data" "$rc" "0"
@@ -1283,14 +1294,15 @@ FAKECR
   if printf '%s' "$plugin_out" | grep -q '^---$'; then ok "menubar: output has --- separator"; else bad "menubar: output has --- separator" ""; fi
   # Contains the in-rotation account name.
   if printf '%s' "$plugin_out" | grep -q 'work'; then ok "menubar: output contains 'work' account"; else bad "menubar: output contains work account" "$plugin_out"; fi
-  # Contains Refresh now action.
+  # With agent loaded, "Refresh now" should appear (not "Enable background refresh").
   if printf '%s' "$plugin_out" | grep -q 'Refresh now'; then ok "menubar: output contains 'Refresh now'"; else bad "menubar: output contains Refresh now" "$plugin_out"; fi
   # Contains Policy submenu header.
   if printf '%s' "$plugin_out" | grep -q 'Policy'; then ok "menubar: output contains 'Policy'"; else bad "menubar: output contains Policy" "$plugin_out"; fi
   # Policy submenu child lines must emit with the -- prefix (Fix 1).
   if printf '%s' "$plugin_out" | grep -q '^--usage-aware'; then ok "menubar: --usage-aware submenu child line emitted"; else bad "menubar: --usage-aware submenu line missing (printf fix)" "$(printf '%s' "$plugin_out" | grep -E '^--' || echo '<none>')"; fi
   # No 'invalid option' errors (Fix 1 regression guard).
-  plugin_out_with_stderr="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" CLAWROUTER_NOTIFY=0 \
+  plugin_out_with_stderr="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" \
+    CLAWROUTER_LAUNCHCTL="$MB_LC" CLAWROUTER_NOTIFY=0 \
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>&1)"
   if printf '%s' "$plugin_out_with_stderr" | grep -q 'invalid option'; then
     bad "menubar: no printf 'invalid option' errors" "$(printf '%s' "$plugin_out_with_stderr" | grep 'invalid option' | head -3)"
@@ -1320,6 +1332,324 @@ echo "== menubar plugin: empty/garbage cr output -> graceful fallback =="
   first_line2="$(printf '%s' "$plugin_out" | head -1)"
   if printf '%s' "$first_line2" | grep -q '🦞'; then ok "menubar empty cr: first line contains 🦞"; else bad "menubar empty cr: first line contains 🦞" "$first_line2"; fi
   if printf '%s' "$plugin_out" | grep -qiE 'no data|refresh'; then ok "menubar empty cr: hints to refresh"; else bad "menubar empty cr: no-data hint" "$plugin_out"; fi
+)
+
+# =========================================================================
+# menubar agent tests
+# =========================================================================
+
+# Build a fake launchctl that records its argv to a file, and whose `print`
+# subcommand succeeds or fails based on the FAKE_LAUNCHCTL_PRINT_OK env var.
+FAKE_LC_DIR="$SBX/fake_lc_bin"
+FAKE_LC_LOG="$SBX/fake_lc_calls.log"
+export FAKE_LC_LOG
+mkdir -p "$FAKE_LC_DIR"
+cat > "$FAKE_LC_DIR/launchctl" <<'EOFAKECTL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_LC_LOG"
+if [[ "${1:-}" == "print" ]]; then
+  if [[ "${FAKE_LAUNCHCTL_PRINT_OK:-0}" == "1" ]]; then
+    exit 0
+  else
+    exit 1
+  fi
+fi
+exit 0
+EOFAKECTL
+chmod +x "$FAKE_LC_DIR/launchctl"
+FAKE_LC="$FAKE_LC_DIR/launchctl"
+
+echo "== menubar agent: install writes plist + loads =="
+(
+  T="$SBX/agent_install_test"
+  mkdir -p "$T"
+  : > "$FAKE_LC_LOG"
+
+  # Use /usr/bin/true — it must exist and be executable (Fix 5 requires -x CR_BIN).
+  # Set FAKE_LAUNCHCTL_PRINT_OK=1 so the post-load verification (Fix 2) passes.
+  rc=0
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/usr/bin/true" FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" install 120 2>/dev/null
+  rc=$?
+  eq "agent install: exits 0" "$rc" "0"
+
+  plist="$T/com.clawrouter.refresh.plist"
+  if [[ -f "$plist" ]]; then ok "agent install: plist exists"; else bad "agent install: plist missing" "$plist"; fi
+
+  # Assert required plist content.
+  if grep -q 'com.clawrouter.refresh' "$plist" 2>/dev/null; then ok "agent plist: contains label"; else bad "agent plist: label missing" "$(cat "$plist")"; fi
+  if grep -q 'status' "$plist" 2>/dev/null; then ok "agent plist: contains 'status' arg"; else bad "agent plist: status arg missing" ""; fi
+  if grep -q -- '--refresh' "$plist" 2>/dev/null; then ok "agent plist: contains '--refresh' arg"; else bad "agent plist: --refresh arg missing" ""; fi
+  if grep -q '<integer>120</integer>' "$plist" 2>/dev/null; then ok "agent plist: StartInterval=120"; else bad "agent plist: StartInterval not 120" "$(grep -A1 StartInterval "$plist")"; fi
+  if grep -q '/usr/bin/true' "$plist" 2>/dev/null; then ok "agent plist: contains CR path"; else bad "agent plist: CR path missing" ""; fi
+
+  # Fix 3: plist must NOT set RunAtLoad=true (to avoid double Keychain prompts).
+  if grep -A1 'RunAtLoad' "$plist" 2>/dev/null | grep -q '<true/>'; then
+    bad "agent plist: RunAtLoad must not be true (double-start risk)" "$(grep -A1 RunAtLoad "$plist")"
+  else
+    ok "agent plist: RunAtLoad is not true (no double-start)"
+  fi
+
+  # Fix 1: plist must be plutil-valid (if plutil is available).
+  if command -v plutil >/dev/null 2>&1; then
+    if plutil -lint "$plist" >/dev/null 2>&1; then
+      ok "agent plist: plutil -lint passes (well-formed XML)"
+    else
+      bad "agent plist: plutil -lint failed" "$(plutil -lint "$plist" 2>&1)"
+    fi
+  else
+    ok "agent plist: plutil not available — skipping lint check"
+  fi
+
+  # Fake launchctl must have been called with bootstrap (or load) and kickstart.
+  if grep -qE 'bootstrap|load' "$FAKE_LC_LOG" 2>/dev/null; then ok "agent install: launchctl bootstrap/load called"; else bad "agent install: launchctl not called for load" "$(cat "$FAKE_LC_LOG")"; fi
+  if grep -q 'kickstart' "$FAKE_LC_LOG" 2>/dev/null; then ok "agent install: launchctl kickstart called"; else bad "agent install: launchctl kickstart not called" "$(cat "$FAKE_LC_LOG")"; fi
+)
+
+echo "== menubar agent: status + uninstall =="
+(
+  T="$SBX/agent_su_test"
+  mkdir -p "$T"
+  : > "$FAKE_LC_LOG"
+
+  # Install first (FAKE_LAUNCHCTL_PRINT_OK=1 so Fix 2 post-load verification passes).
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/usr/bin/true" FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" install 300 2>/dev/null
+
+  # Status with agent "loaded" (print returns success).
+  status_out="$(CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" status 2>/dev/null)"; rc=$?
+  eq "agent status: exits 0" "$rc" "0"
+  if printf '%s' "$status_out" | grep -qiE 'loaded.*yes|yes'; then ok "agent status: reports loaded=yes"; else bad "agent status: loaded=yes not shown" "$status_out"; fi
+  if printf '%s' "$status_out" | grep -qiE 'installed|plist'; then ok "agent status: mentions plist"; else bad "agent status: plist mention missing" "$status_out"; fi
+
+  # Uninstall.
+  : > "$FAKE_LC_LOG"
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    bash "$CR_REPO/menubar/agent.sh" uninstall 2>/dev/null
+  plist="$T/com.clawrouter.refresh.plist"
+  if [[ ! -f "$plist" ]]; then ok "agent uninstall: plist removed"; else bad "agent uninstall: plist still present" "$plist"; fi
+  if grep -qE 'bootout|unload' "$FAKE_LC_LOG" 2>/dev/null; then ok "agent uninstall: launchctl bootout/unload called"; else bad "agent uninstall: launchctl not called" "$(cat "$FAKE_LC_LOG")"; fi
+)
+
+echo "== menubar agent: install rejects bad interval / missing cr =="
+(
+  T="$SBX/agent_bad_test"
+  mkdir -p "$T"
+
+  # Bad interval.
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/usr/bin/true" \
+    bash "$CR_REPO/menubar/agent.sh" install notanumber 2>/dev/null; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "agent install bad interval: exits nonzero"; else bad "agent install bad interval: should fail" "rc=$rc"; fi
+
+  # Missing cr: clear CLAWROUTER_CR and ensure cr is not on PATH via a clean PATH.
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="" PATH="/usr/bin:/bin" \
+    bash "$CR_REPO/menubar/agent.sh" install 300 2>"$SBX/agent_no_cr_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "agent install missing cr: exits nonzero"; else bad "agent install missing cr: should fail" "rc=$rc"; fi
+  if grep -qiE 'cr|binary|CLAWROUTER_CR' "$SBX/agent_no_cr_err" 2>/dev/null; then ok "agent install missing cr: helpful message"; else bad "agent install missing cr: message missing" "$(cat "$SBX/agent_no_cr_err")"; fi
+)
+
+echo "== menubar agent: install fails when launchctl cannot load (Fix 2) =="
+(
+  # Build a fake launchctl whose bootstrap AND load both exit 1, and print exits 1.
+  FAIL_LC_DIR="$SBX/fail_lc_bin"
+  mkdir -p "$FAIL_LC_DIR"
+  cat > "$FAIL_LC_DIR/launchctl" <<'EOFAIL'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "print" ]]; then exit 1; fi
+if [[ "${1:-}" == "bootout" ]]; then exit 0; fi
+# bootstrap and load both fail.
+exit 1
+EOFAIL
+  chmod +x "$FAIL_LC_DIR/launchctl"
+
+  T="$SBX/agent_fail_load_test"
+  mkdir -p "$T"
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAIL_LC_DIR/launchctl" \
+    CLAWROUTER_CR="/usr/bin/true" \
+    bash "$CR_REPO/menubar/agent.sh" install 120 2>"$SBX/agent_fail_load_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "agent install load-fail: exits nonzero"; else bad "agent install load-fail: should fail" "rc=$rc"; fi
+  if grep -qiE 'error|failed to load' "$SBX/agent_fail_load_err" 2>/dev/null; then
+    ok "agent install load-fail: error message printed"
+  else
+    bad "agent install load-fail: error message missing" "$(cat "$SBX/agent_fail_load_err")"
+  fi
+)
+
+echo "== menubar agent: kick exits nonzero when agent not loaded (Fix 4) =="
+(
+  T="$SBX/agent_kick_unloaded"
+  mkdir -p "$T"
+  # FAKE_LAUNCHCTL_PRINT_OK defaults to 0 → print fails → agent not loaded.
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    FAKE_LAUNCHCTL_PRINT_OK=0 \
+    bash "$CR_REPO/menubar/agent.sh" kick 2>"$SBX/agent_kick_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "agent kick unloaded: exits nonzero"; else bad "agent kick unloaded: should exit nonzero" "rc=$rc"; fi
+  if grep -qiE 'not loaded|install' "$SBX/agent_kick_err" 2>/dev/null; then
+    ok "agent kick unloaded: helpful message"
+  else
+    bad "agent kick unloaded: message missing" "$(cat "$SBX/agent_kick_err")"
+  fi
+)
+
+echo "== menubar agent: cr menubar refresh exits nonzero when agent not loaded =="
+(
+  T="$SBX/cr_menubar_kick_unloaded"
+  mkdir -p "$T"
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    FAKE_LAUNCHCTL_PRINT_OK=0 \
+    "$CR" menubar refresh 2>/dev/null; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "cr menubar refresh unloaded: exits nonzero"; else bad "cr menubar refresh unloaded: should exit nonzero" "rc=$rc"; fi
+)
+
+echo "== menubar agent: install rejects non-executable CR_BIN (Fix 5) =="
+(
+  T="$SBX/agent_nonexec_cr"
+  mkdir -p "$T"
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/nonexistent/cr" FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" install 300 2>"$SBX/agent_nonexec_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "agent install non-executable cr: exits nonzero"; else bad "agent install non-executable cr: should fail" "rc=$rc"; fi
+  if grep -qiE 'not executable|executable|install cr' "$SBX/agent_nonexec_err" 2>/dev/null; then
+    ok "agent install non-executable cr: helpful message"
+  else
+    bad "agent install non-executable cr: message missing" "$(cat "$SBX/agent_nonexec_err")"
+  fi
+)
+
+echo "== cr menubar dispatches to agent =="
+(
+  T="$SBX/cr_menubar_test"
+  mkdir -p "$T"
+  : > "$FAKE_LC_LOG"
+
+  # Install an agent plist so status has something to show.
+  # FAKE_LAUNCHCTL_PRINT_OK=1 so the post-load verification (Fix 2) passes.
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/usr/bin/true" FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" install 300 2>/dev/null
+
+  # cr menubar status — should exit 0 and show agent info.
+  status_out="$(CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    FAKE_LAUNCHCTL_PRINT_OK=1 \
+    "$CR" menubar status 2>/dev/null)"; rc=$?
+  eq "cr menubar status: exits 0" "$rc" "0"
+
+  # cr menubar refresh — should call launchctl kickstart.
+  : > "$FAKE_LC_LOG"
+  CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    FAKE_LAUNCHCTL_PRINT_OK=1 \
+    "$CR" menubar refresh 2>/dev/null || true
+  if grep -q 'kickstart' "$FAKE_LC_LOG" 2>/dev/null; then ok "cr menubar refresh: calls launchctl kickstart"; else bad "cr menubar refresh: kickstart not called" "$(cat "$FAKE_LC_LOG")"; fi
+)
+
+echo "== menubar plugin: no self-refresh; refresh delegates =="
+(
+  # Assert the plugin contains no execution of status --refresh.
+  if grep -nE '"?\$CR_BIN"?[[:space:]]+status[[:space:]]+--refresh|\$\(.*status --refresh' \
+      "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null | grep -v '^.*#'; then
+    bad "plugin: no 'status --refresh' execution found" "grep found execution form(s) above"
+  else
+    ok "plugin: contains no 'status --refresh' execution"
+  fi
+
+  MB_BIN3="$SBX/mb_bin3"; mkdir -p "$MB_BIN3"
+  MB_JQ="$(command -v jq)"
+
+  # Good JSON for one in-rotation subscription account, stale=true.
+  cat > "$MB_BIN3/cr" <<'FAKECR3'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "status" && "${2:-}" == "--json" ]]; then
+  cat <<'ENDJSON'
+{
+  "schema": 1,
+  "generatedAt": "2026-01-01T00:00:00Z",
+  "policy": "round-robin",
+  "pinned": null,
+  "exhaustedAtPct": 100,
+  "ttlSeconds": 900,
+  "next": {"name": null, "note": "next in rotation"},
+  "accounts": [
+    {
+      "name": "work", "kind": "subscription",
+      "email": "work@example.com",
+      "enabled": true, "rotate": true, "inRotation": true,
+      "usagePct": 58, "exhausted": false, "stale": true,
+      "checkedAt": null,
+      "windows": [
+        {"label": "5h session", "usedPct": 58, "leftPct": 42, "resetsAt": null}
+      ]
+    }
+  ]
+}
+ENDJSON
+  exit 0
+fi
+exit 0
+FAKECR3
+  chmod +x "$MB_BIN3/cr"
+
+  # Render with agent NOT loaded (FAKE_LAUNCHCTL_PRINT_OK=0).
+  plugin_out_noagent="$(CLAWROUTER_CR="$MB_BIN3/cr" CLAWROUTER_JQ="$MB_JQ" \
+    CLAWROUTER_LAUNCHCTL="$FAKE_LC" CLAWROUTER_NOTIFY=0 \
+    FAKE_LAUNCHCTL_PRINT_OK=0 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
+
+  if printf '%s' "$plugin_out_noagent" | grep -q 'Enable background refresh'; then
+    ok "plugin no-agent: shows 'Enable background refresh' action"
+  else
+    bad "plugin no-agent: 'Enable background refresh' missing" \
+      "$(printf '%s' "$plugin_out_noagent" | grep -i refresh || echo '<none>')"
+  fi
+  if printf '%s' "$plugin_out_noagent" | grep -q 'param2=--refresh'; then
+    bad "plugin no-agent: must not contain param2=--refresh" \
+      "$(printf '%s' "$plugin_out_noagent" | grep 'param2=--refresh')"
+  else
+    ok "plugin no-agent: no param2=--refresh in output"
+  fi
+  # Stale hint should appear when agent not loaded.
+  if printf '%s' "$plugin_out_noagent" | grep -qi 'stale\|Enable background refresh'; then
+    ok "plugin no-agent: stale or enable-refresh hint present"
+  else
+    bad "plugin no-agent: expected stale/enable hint" \
+      "$(printf '%s' "$plugin_out_noagent" | head -20)"
+  fi
+
+  # Render with agent loaded (FAKE_LAUNCHCTL_PRINT_OK=1).
+  plugin_out_agent="$(CLAWROUTER_CR="$MB_BIN3/cr" CLAWROUTER_JQ="$MB_JQ" \
+    CLAWROUTER_LAUNCHCTL="$FAKE_LC" CLAWROUTER_NOTIFY=0 \
+    FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
+
+  if printf '%s' "$plugin_out_agent" | grep -q 'Refresh now'; then
+    ok "plugin agent-loaded: shows 'Refresh now' action"
+  else
+    bad "plugin agent-loaded: 'Refresh now' missing" \
+      "$(printf '%s' "$plugin_out_agent" | grep -i refresh || echo '<none>')"
+  fi
+  if printf '%s' "$plugin_out_agent" | grep -q 'kickstart'; then
+    ok "plugin agent-loaded: Refresh now uses kickstart"
+  else
+    bad "plugin agent-loaded: kickstart not in Refresh now line" \
+      "$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '<none>')"
+  fi
+  if printf '%s' "$plugin_out_agent" | grep -q 'com.clawrouter.refresh'; then
+    ok "plugin agent-loaded: Refresh now references label"
+  else
+    bad "plugin agent-loaded: label missing from Refresh now" \
+      "$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '<none>')"
+  fi
+  if printf '%s' "$plugin_out_agent" | grep -q 'param2=--refresh'; then
+    bad "plugin agent-loaded: must not contain param2=--refresh" \
+      "$(printf '%s' "$plugin_out_agent" | grep 'param2=--refresh')"
+  else
+    ok "plugin agent-loaded: no param2=--refresh in output"
+  fi
 )
 
 echo

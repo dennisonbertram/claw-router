@@ -306,19 +306,24 @@ brew install jq                   # if you don't already have it
 mkdir -p ~/.config/swiftbar
 ln -s "$PWD/menubar/clawrouter.30s.sh" ~/.config/swiftbar/
 # point SwiftBar at ~/.config/swiftbar on first launch, then enable the plugin
+cr menubar install                # start the background usage-refresh agent
 ```
 
 The bar shows the binding constraint — the *least* headroom across your in-rotation
 accounts (`🦞 58%`, colored by how much is left). The dropdown breaks it down per
 account and per window with reset countdowns, and gives you one-click actions to
-switch policy, pin an account, or force a refresh. When an in-rotation account
-crosses the exhaustion threshold it fires a single macOS notification.
+switch policy, pin an account, or trigger a refresh.
 
-It reads the cached snapshot via the new `cr status --json` for instant draws, and
-only refreshes in the background when a subscription's cache is stale (respecting
-`cr config ttl`). See [`menubar/README.md`](menubar/README.md) for configuration
-(`CLAWROUTER_CR`, `CLAWROUTER_NOTIFY`), an optional `launchd` cache-warmer, and
-troubleshooting.
+The plugin reads only the cached snapshot (`cr status --json`) — no network, no
+Keychain access at render time. A small launchd LaunchAgent (`cr menubar install`)
+refreshes the cache every 5 minutes in the background. macOS will ask to allow
+Keychain access for each account the first time the agent runs — click
+**Always Allow** and it never asks again. When an in-rotation account crosses the
+exhaustion threshold the plugin fires a single macOS notification.
+
+See [`menubar/README.md`](menubar/README.md) for agent management (`cr menubar
+status`, `cr menubar refresh`, `cr menubar uninstall`), configuration
+(`CLAWROUTER_CR`, `CLAWROUTER_NOTIFY`), and troubleshooting.
 
 `cr status --json` is also useful on its own — a machine-readable usage snapshot
 (policy, next pick, per-account/per-window headroom, exhaustion, staleness) you can

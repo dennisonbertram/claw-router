@@ -21,6 +21,25 @@ PATH="/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin:${PATH}"
 
 CR_BIN="${CLAWROUTER_CR:-cr}"
 JQ_BIN="${CLAWROUTER_JQ:-jq}"
+LAUNCHCTL="${CLAWROUTER_LAUNCHCTL:-launchctl}"
+LABEL="com.clawrouter.refresh"
+AGENT_DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
+
+# Resolve this plugin's real directory (handles SwiftBar symlinks).
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  d=$(cd -P "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  case "$self" in /*) ;; *) self="$d/$self" ;; esac
+done
+MENUBAR_DIR=$(cd -P "$(dirname "$self")" && pwd)
+AGENT_SH="$MENUBAR_DIR/agent.sh"
+
+# Detect whether the background refresh LaunchAgent is loaded.
+agent_loaded=0
+if command -v "$LAUNCHCTL" >/dev/null 2>&1; then
+  "$LAUNCHCTL" print "$AGENT_DOMAIN/$LABEL" >/dev/null 2>&1 && agent_loaded=1 || true
+fi
 
 # Check for required tools before doing anything else.
 if ! command -v "$CR_BIN" >/dev/null 2>&1 || ! command -v "$JQ_BIN" >/dev/null 2>&1; then
@@ -36,7 +55,7 @@ if ! command -v "$CR_BIN" >/dev/null 2>&1 || ! command -v "$JQ_BIN" >/dev/null 2
   exit 0
 fi
 
-# --- Fetch cached data (fast, no network) ----------------------------------
+# --- Fetch cached data (fast, no network, no Keychain) ---------------------
 data="$("$CR_BIN" status --json 2>/dev/null)" || data=""
 
 # Validate JSON.
@@ -45,15 +64,6 @@ if [[ -z "$data" ]] || ! printf '%s' "$data" | "$JQ_BIN" -e . >/dev/null 2>&1; t
   echo '---'
   printf 'No data yet — open a terminal and run: cr status --refresh\n'
   exit 0
-fi
-
-# --- Self-refresh when stale (non-blocking) --------------------------------
-# Only subscription in-rotation accounts are polled by cr status --refresh.
-# Triggering a refresh for non-subscription (api/backend) stale accounts would
-# loop forever since they can never be refreshed that way.
-stale_inrotation="$(printf '%s' "$data" | "$JQ_BIN" -r '[.accounts[] | select(.kind=="subscription" and .inRotation==true and .stale==true)] | length')" || stale_inrotation=0
-if [[ "${stale_inrotation:-0}" -gt 0 ]]; then
-  ("$CR_BIN" status --refresh >/dev/null 2>&1 &) || true
 fi
 
 # --- Compute title ---------------------------------------------------------
@@ -147,6 +157,12 @@ fi
 printf '%s | font=Menlo size=12\n' "$header_line"
 echo '---'
 
+# --- Stale-data hint (shown only when agent is not loaded) -----------------
+stale_inrotation="$(printf '%s' "$data" | "$JQ_BIN" -r '[.accounts[] | select(.kind=="subscription" and .inRotation==true and .stale==true)] | length')" || stale_inrotation=0
+if [[ "${stale_inrotation:-0}" -gt 0 && "$agent_loaded" -eq 0 ]]; then
+  printf '%s\n' '⚠ Usage is stale — turn on "Enable background refresh" below | color=#c8821a font=Menlo size=12'
+fi
+
 # --- Per-account rows: in-rotation first, then non-rotating ---------------
 # Read all accounts as JSON lines; sort inRotation=true first.
 acct_json_list="$(printf '%s' "$data" | "$JQ_BIN" -c '[.accounts[] | {name,kind,email,inRotation,usagePct,exhausted,stale,windows,enabled}] | sort_by(.inRotation | not)')" || acct_json_list="[]"
@@ -214,7 +230,14 @@ done
 
 # --- Actions section -------------------------------------------------------
 echo '---'
-printf 'Refresh now | shell=%s | param1=status | param2=--refresh | terminal=false | refresh=true\n' "$CR_BIN"
+# "Refresh now" delegates to the background agent (no Keychain prompts in the plugin).
+# If the agent is not loaded, offer to install it instead.
+if [[ "$agent_loaded" -eq 1 ]]; then
+  printf 'Refresh now | shell=%s | param1=kickstart | param2=-k | param3=%s/%s | terminal=false | refresh=true\n' \
+    "$LAUNCHCTL" "$AGENT_DOMAIN" "$LABEL"
+else
+  printf '%s\n' "Enable background refresh… | shell=${AGENT_SH} | param1=install | terminal=true | refresh=true"
+fi
 printf '%s\n' 'Policy'
 for p in round-robin lru random usage-aware; do
   printf '%s\n' "--${p} | shell=${CR_BIN} | param1=policy | param2=${p} | terminal=false | refresh=true"

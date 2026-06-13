@@ -958,6 +958,21 @@ cr_doctor() {
   fi
 }
 
+# Forward to menubar/agent.sh, mapping "refresh" → "kick" as a friendly alias.
+# Always macOS-only: if agent.sh is missing, die with a clear message.
+cr_cmd_menubar() {
+  local agent_sh="${CR_DIR}/menubar/agent.sh"
+  if [[ ! -f "$agent_sh" ]]; then
+    cr_die "menubar/agent.sh not found — is this a full Claw Router install at ${CR_DIR}?"
+  fi
+
+  local action="${1:-status}"; shift || true
+  # Map "refresh" → "kick" for user-friendly naming.
+  [[ "$action" == "refresh" ]] && action="kick"
+
+  bash "$agent_sh" "$action" "$@"
+}
+
 cr_cmd_help() {
   local b="$C_BOLD" d="$C_DIM" r="$C_RESET" a="$C_ACCENT" cy="$C_CYAN" gn="$C_GREEN" gy="$C_GREY"
   # cmd col desc — aligns the description column with padding.
@@ -1000,6 +1015,7 @@ cr_cmd_help() {
   head "Inspect"
   cmd "cr usage [name]"            "usage meters per window (--plain = one line)"
   cmd "cr doctor [name]"           "verify dirs + keychain credentials"
+  cmd "cr menubar <action>"        "background usage refresher for the menu-bar plugin (macOS launchd)"
   cmd "cr help"                    "this help"
 
   head "First-time setup"
@@ -1086,6 +1102,7 @@ main() {
     usage)            shift; cr_cmd_usage "$@" ;;
     adopt)            shift; cr_cmd_adopt "$@" ;;
     status)           shift; cr_cmd_status "$@" ;;
+    menubar)          shift; cr_cmd_menubar "$@" ;;
     doctor)           shift; cr_doctor "${1:-}" ;;
     help|--help|-h)   cr_cmd_help ;;
     "")               # plain `cr`: with no accounts yet, show help instead of erroring
