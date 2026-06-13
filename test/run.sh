@@ -1522,6 +1522,29 @@ echo "== menubar agent: install rejects non-executable CR_BIN (Fix 5) =="
   fi
 )
 
+echo "== menubar agent: logs into the legacy data home, never creates ~/.claw-router =="
+(
+  # Regression: agent.sh once hardcoded ~/.claw-router for its log + mkdir'd it,
+  # which flipped cr's legacy-aware CR_HOME resolution and orphaned an existing
+  # ~/.claude-router install. The plist log path must follow the resolved home.
+  H="$SBX/legacyhomeuser"; mkdir -p "$H/.claude-router/logs"   # legacy home exists, new one does NOT
+  T="$SBX/agent_home_test"; mkdir -p "$T"
+  # Unset the suite-global CR_HOME so agent.sh exercises the legacy-aware
+  # resolution (the real-world path), not an explicit override.
+  env -u CR_HOME HOME="$H" CLAWROUTER_LAUNCH_AGENTS_DIR="$T" CLAWROUTER_LAUNCHCTL="$FAKE_LC" \
+    CLAWROUTER_CR="/usr/bin/true" FAKE_LAUNCHCTL_PRINT_OK=1 \
+    bash "$CR_REPO/menubar/agent.sh" install 300 2>/dev/null; rc=$?
+  eq "agent install (legacy home): exits 0" "$rc" "0"
+  plist="$T/com.clawrouter.refresh.plist"
+  if grep -q "$H/.claude-router/logs/refresh-agent.log" "$plist" 2>/dev/null; then
+    ok "agent plist: logs into the legacy .claude-router home"
+  else
+    bad "agent plist: log path not in legacy home" "$(grep -i standard "$plist" 2>/dev/null)"
+  fi
+  if grep -q '.claw-router' "$plist" 2>/dev/null; then bad "agent plist: must not reference .claw-router" "$(grep claw "$plist")"; else ok "agent plist: no .claw-router reference"; fi
+  if [[ ! -d "$H/.claw-router" ]]; then ok "agent install: did NOT create ~/.claw-router (no CR_HOME flip)"; else bad "agent install: created ~/.claw-router (flips CR_HOME!)" "$(ls -la "$H")"; fi
+)
+
 echo "== cr menubar dispatches to agent =="
 (
   T="$SBX/cr_menubar_test"

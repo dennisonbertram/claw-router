@@ -27,7 +27,20 @@ PLIST="$AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL="${CLAWROUTER_LAUNCHCTL:-launchctl}"
 # Fix 6: use || echo 0 fallback to match plugin consistency.
 DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
-LOG_PATH="$HOME/.claw-router/logs/refresh-agent.log"
+
+# Data home — MUST match lib/common.sh's resolution so the agent logs into (and
+# the polled `cr` reads) the SAME directory. Hardcoding ~/.claw-router here
+# would CREATE it and flip cr's legacy-aware resolution, orphaning an existing
+# ~/.claude-router install. Honor an explicit CR_HOME, else prefer the legacy
+# dir when it exists and the new one does not.
+if [[ -n "${CR_HOME:-}" ]]; then
+  CR_DATA_HOME="$CR_HOME"
+elif [[ -d "$HOME/.claude-router" && ! -d "$HOME/.claw-router" ]]; then
+  CR_DATA_HOME="$HOME/.claude-router"
+else
+  CR_DATA_HOME="$HOME/.claw-router"
+fi
+LOG_PATH="$CR_DATA_HOME/logs/refresh-agent.log"
 
 # Resolve the cr binary: explicit env > PATH search.
 _resolve_cr_bin() {
@@ -92,12 +105,13 @@ _cmd_install() {
 
   # Create directories.
   mkdir -p "$AGENTS_DIR"
-  mkdir -p "$HOME/.claw-router/logs"
+  mkdir -p "$(dirname "$LOG_PATH")"
 
   # Pre-escape dynamic values for XML (Fix 1).
-  local cr_bin_escaped home_escaped
+  local cr_bin_escaped home_escaped log_escaped
   cr_bin_escaped="$(printf '%s' "$CR_BIN" | _xml_escape)"
   home_escaped="$(printf '%s' "$HOME" | _xml_escape)"
+  log_escaped="$(printf '%s' "$LOG_PATH" | _xml_escape)"
 
   # Write the plist using printf (no eval, no shell expansion inside XML values).
   # Fix 3: RunAtLoad omitted — rely solely on post-install kickstart for first run
@@ -124,9 +138,9 @@ _cmd_install() {
   printf '    <string>/opt/homebrew/bin:/usr/local/bin:%s/.local/bin:/usr/bin:/bin</string>\n' "$home_escaped" >> "$PLIST"
   printf '  </dict>\n' >> "$PLIST"
   printf '  <key>StandardOutPath</key>\n' >> "$PLIST"
-  printf '  <string>%s/.claw-router/logs/refresh-agent.log</string>\n' "$home_escaped" >> "$PLIST"
+  printf '  <string>%s</string>\n' "$log_escaped" >> "$PLIST"
   printf '  <key>StandardErrorPath</key>\n' >> "$PLIST"
-  printf '  <string>%s/.claw-router/logs/refresh-agent.log</string>\n' "$home_escaped" >> "$PLIST"
+  printf '  <string>%s</string>\n' "$log_escaped" >> "$PLIST"
   printf '</dict>\n' >> "$PLIST"
   printf '</plist>\n' >> "$PLIST"
 
@@ -157,7 +171,7 @@ _cmd_install() {
 
   printf '\nClaw Router background refresh agent installed.\n' >&2
   printf '  Polls every %ss using: %s\n' "$interval" "$CR_BIN" >&2
-  printf '  Log: %s/.claw-router/logs/refresh-agent.log\n' "$HOME" >&2
+  printf '  Log: %s\n' "$LOG_PATH" >&2
   printf '\n' >&2
   printf '*** IMPORTANT — one-time Keychain setup ***\n' >&2
   printf 'macOS will ask to allow access to each account'\''s Keychain credential\n' >&2
@@ -201,7 +215,7 @@ _cmd_status() {
     printf '  interval: %ss\n' "$interval"
   fi
 
-  local log="$HOME/.claw-router/logs/refresh-agent.log"
+  local log="$LOG_PATH"
   if [[ -f "$log" ]]; then
     printf '  log (last 3 lines):\n'
     tail -3 "$log" 2>/dev/null | sed 's/^/    /' || true
