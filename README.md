@@ -115,6 +115,7 @@ Manage (never forwarded to claude):
 | `cr add-api <name>` | register an Anthropic API key account (explicit-only by default) |
 | `cr rotate <name> on\|off` | opt an api-key account in or out of rotation |
 | `cr register-default [name]` | register the existing `~/.claude` login (no dir move) |
+| `cr relink [--all\|<name>]` | re-apply `~/.claude` sharing to existing accounts (run once after upgrading) |
 | `cr login <name>` / `cr logout <name>` | (re)auth / sign out an account |
 | `cr remove <name>` | unregister (prints how to delete its dir + keychain item) |
 | `cr list` (`accounts`, `ls`) | table of accounts: email, plan, last used, usage%, enabled |
@@ -364,8 +365,13 @@ Claude Code stores each conversation under the account that created it
   resumes regardless of which account created it (see *Sessions across accounts*).
   A bare `--continue` has no id to match — it just runs under the picked account.
 - **Shared settings.** `cr add` symlinks `settings.json`, `CLAUDE.md`,
-  `commands/`, and `rules/` from `~/.claude` so your config isn't fragmented;
-  per-account history/projects stay separate.
+  `commands/`, `rules/`, `skills/`, `agents/`, `hooks/`, `workflows/`, and
+  `plugins/` from `~/.claude` so your full extension environment is available in
+  every account — not just settings. User-scope MCP servers are also merged from
+  `~/.claude.json` into each account's `.claude.json` (the shared source wins on
+  key conflicts; `oauthAccount` identity and all other keys are left per-account).
+  Per-account history/projects stay separate. To apply sharing to accounts created
+  before this version, run `cr relink --all` once after upgrading.
 - The `/api/oauth/usage` endpoint is undocumented; `cr usage` is best-effort and
   degrades gracefully.
 

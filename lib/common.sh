@@ -24,8 +24,13 @@ CR_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
 CR_USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 CR_OAUTH_BETA="oauth-2025-04-20"
 
-# Paths shared (symlinked) from ~/.claude into each account dir at onboarding.
-CR_SHARE_PATHS=(settings.json CLAUDE.md commands rules)
+# Paths shared (symlinked) from the user's ~/.claude into each account dir.
+# skills/agents/hooks/workflows/plugins carry the user's full extension environment.
+CR_SHARE_PATHS=(settings.json CLAUDE.md commands rules skills agents hooks workflows plugins)
+
+# Source locations for sharing (override in tests via env vars).
+CR_CLAUDE_HOME="${CR_CLAUDE_HOME:-$HOME/.claude}"       # dir the share paths come from
+CR_CLAUDE_JSON="${CR_CLAUDE_JSON:-$HOME/.claude.json}"  # default account's config file (mcpServers source)
 
 # --- Color palette -------------------------------------------------------
 # Enabled only when stderr is a TTY and NO_COLOR is unset (https://no-color.org).
@@ -305,4 +310,140 @@ cr_mark_used() {
   now_ms="$(( $(date +%s) * 1000 ))"
   cr_config_update '(.accounts[] | select(.name==$n) | .lastUsed) = ($t|tonumber)' \
     --arg n "$name" --arg t "$now_ms" >/dev/null
+}
+
+# --- Sharing helpers --------------------------------------------------------
+
+# cr_link_shared_paths <account_dir>
+# Idempotent: symlink every CR_SHARE_PATHS entry from CR_CLAUDE_HOME into
+# <account_dir>. If a real file/dir occupies the destination it is backed up as
+# <name>.bak.<epoch>[.<counter>] before the symlink is created. Only rm a stale
+# symlink — never rm a real path. Skips any source that doesn't exist (no dangling
+# links). Reports linked/backed-up counts via cr_say.
+cr_link_shared_paths() {
+  local account_dir="$1"
+  local p src dst linked=0 backed=0 ts counter bak
+
+  ts="$(date +%s)"
+
+  for p in "${CR_SHARE_PATHS[@]}"; do
+    src="${CR_CLAUDE_HOME}/${p}"
+
+    # Skip entirely if the source doesn't exist — don't create a dangling link.
+    if [[ ! -e "$src" ]]; then
+      # If a stale symlink already points at this missing source, remove it.
+      dst="${account_dir}/${p}"
+      if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+        rm -f "$dst" || cr_warn "could not remove stale symlink: $dst"
+      fi
+      continue
+    fi
+
+    dst="${account_dir}/${p}"
+
+    # Already correct — skip (idempotent).
+    if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+      continue
+    fi
+
+    # Something exists at dst that is NOT the right symlink.
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      if [[ -L "$dst" ]]; then
+        # Stale symlink pointing somewhere else — safe to remove.
+        rm -f "$dst" || { cr_warn "could not remove stale symlink: $dst"; continue; }
+      else
+        # Real file or directory — back it up, never rm.
+        bak="${dst}.bak.${ts}"
+        counter=1
+        while [[ -e "$bak" ]]; do
+          bak="${dst}.bak.${ts}.${counter}"
+          counter=$(( counter + 1 ))
+        done
+        if mv "$dst" "$bak"; then
+          cr_say "  backed up: ${p} → $(basename "$bak")"
+          backed=$(( backed + 1 ))
+        else
+          cr_warn "could not back up $dst — skipping $p"
+          continue
+        fi
+      fi
+    fi
+
+    if ln -s "$src" "$dst" 2>/dev/null; then
+      linked=$(( linked + 1 ))
+    else
+      cr_warn "could not symlink $p into $(basename "$account_dir")"
+    fi
+  done
+
+  local backed_note=""; [[ "$backed" -gt 0 ]] && backed_note=", backed up ${backed}"
+  cr_say "  shared: linked ${linked} path(s)${backed_note} in $(basename "$account_dir")"
+}
+
+# cr_merge_account_mcp <account_name>
+# Surgically merges .mcpServers from CR_CLAUDE_JSON into the account's .claude.json,
+# with the shared source winning on key conflicts. Identity (oauthAccount) and all
+# other keys are untouched. Atomic: writes to a temp file in the same dir, validates
+# JSON, then mv -f. Safe to call multiple times (idempotent merge).
+cr_merge_account_mcp() {
+  local name="$1"
+  local dir acct_json src tmp n
+
+  dir="$(cr_account_dir "$name" 2>/dev/null || true)"
+
+  # Skip the null-configDir (default) account — it IS the source.
+  if [[ -z "$dir" ]]; then return 0; fi
+
+  # Skip backends — they have no .claude.json of their own.
+  local kind; kind="$(cr_account_kind "$name" 2>/dev/null || true)"
+  if [[ "$kind" == "backend" ]]; then return 0; fi
+
+  acct_json="${dir}/.claude.json"
+  if [[ ! -f "$acct_json" ]]; then return 0; fi
+
+  # Read shared mcpServers from the source config.
+  src="$(jq -c '.mcpServers // {}' "$CR_CLAUDE_JSON" 2>/dev/null || echo '{}')"
+  if [[ -z "$src" || "$src" == '{}' ]]; then return 0; fi
+
+  n="$(printf '%s' "$src" | jq 'keys|length' 2>/dev/null || echo 0)"
+
+  # Merge: account-only servers preserved, source wins on conflicts.
+  tmp="$(mktemp "${acct_json}.XXXXXX")" || { cr_warn "mktemp failed for $name mcp merge"; return 1; }
+  if jq --argjson shared "$src" '.mcpServers = ((.mcpServers // {}) * $shared)' \
+       "$acct_json" > "$tmp" 2>/dev/null; then
+    if jq empty "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$acct_json" || { cr_warn "could not replace $acct_json after mcp merge"; rm -f "$tmp"; return 1; }
+      cr_say "  merged ${n} mcp server(s) into '${name}' (source wins on conflicts; identity preserved)"
+    else
+      cr_warn "mcp merge produced invalid JSON for '$name' — leaving .claude.json untouched"
+      rm -f "$tmp"
+    fi
+  else
+    cr_warn "jq failed merging mcp servers for '$name' — leaving .claude.json untouched"
+    rm -f "$tmp"
+  fi
+}
+
+# cr_relink_account <name>
+# Run cr_link_shared_paths + cr_merge_account_mcp for a single account.
+# Skips the null-configDir default account and backends with a friendly note.
+cr_relink_account() {
+  local name="$1"
+  local dir kind
+
+  dir="$(cr_account_dir "$name" 2>/dev/null || true)"
+  kind="$(cr_account_kind "$name" 2>/dev/null || true)"
+
+  if [[ -z "$dir" ]]; then
+    cr_say "  skip '$name': null configDir (this IS the default ~/.claude environment)"
+    return 0
+  fi
+  if [[ "$kind" == "backend" ]]; then
+    cr_say "  skip '$name': backend accounts have no config dir to share into"
+    return 0
+  fi
+
+  cr_say "relink '$name' (${dir}):"
+  cr_link_shared_paths "$dir"
+  cr_merge_account_mcp "$name"
 }

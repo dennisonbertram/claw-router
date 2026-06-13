@@ -293,14 +293,8 @@ cr_cmd_add() {
   local dir="${CR_ACCOUNTS_DIR}/${name}"
   mkdir -p "$dir"
 
-  # Symlink shared bits from ~/.claude so settings/commands aren't fragmented.
-  local p src
-  for p in "${CR_SHARE_PATHS[@]}"; do
-    src="${HOME}/.claude/${p}"
-    if [[ -e "$src" && ! -e "${dir}/${p}" ]]; then
-      ln -s "$src" "${dir}/${p}" 2>/dev/null || cr_warn "could not symlink $p"
-    fi
-  done
+  # Symlink shared bits from ~/.claude BEFORE login so plugins/ pre-exists.
+  cr_link_shared_paths "$dir"
 
   cr_say "Logging in for account '$name' (a browser window will open)…"
   local claude; claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
@@ -316,6 +310,11 @@ cr_cmd_add() {
   cr_config_update '.accounts += [{
       name:$n, configDir:$d, email:$e, plan:$pl, lastUsed:0, enabled:true, usagePct:null }]' \
     --arg n "$name" --arg d "$dir" --arg e "$email" --arg pl "$plan"
+
+  # Merge user-scope MCP servers from ~/.claude.json into the account's
+  # .claude.json. Must run AFTER the account is registered above, since the
+  # merge resolves the account's dir from config.
+  cr_merge_account_mcp "$name" 2>/dev/null || true
 
   cr_say "Added account '$name'${email:+ ($email)}."
   cr_doctor "$name" || true
@@ -414,13 +413,7 @@ cr_cmd_add_api() {
   mkdir -p "$dir"
 
   # Symlink shared bits from ~/.claude.
-  local p src
-  for p in "${CR_SHARE_PATHS[@]}"; do
-    src="${HOME}/.claude/${p}"
-    if [[ -e "$src" && ! -e "${dir}/${p}" ]]; then
-      ln -s "$src" "${dir}/${p}" 2>/dev/null || cr_warn "could not symlink $p"
-    fi
-  done
+  cr_link_shared_paths "$dir"
 
   # Store key in keychain (macOS) or plaintext fallback.
   local stored="keychain"
@@ -498,6 +491,58 @@ cr_cmd_register_default() {
       name:$n, configDir:null, email:$e, plan:$pl, lastUsed:0, enabled:true, usagePct:null }]' \
     --arg n "$name" --arg e "$email" --arg pl "$plan"
   cr_say "Registered existing ~/.claude login as '$name'${email:+ ($email)}."
+}
+
+# Re-apply shared environment from ~/.claude to one or all accounts.
+#   cr relink [--all | <name>]
+# With no arg: relinks all accounts that have a configDir (skips default + backends).
+# With <name>: relinks that one account.
+# With --all: same as no arg (explicit).
+cr_cmd_relink() {
+  cr_ensure_home
+
+  [[ $# -gt 1 ]] && cr_die "usage: cr relink [--all|<name>]"
+  local target="${1:-}"
+
+  # Helper: relink all eligible accounts.
+  _relink_all() {
+    local linked_count=0
+    local a kind dir
+    while IFS= read -r a; do
+      kind="$(cr_account_kind "$a" 2>/dev/null || true)"
+      dir="$(cr_account_dir "$a" 2>/dev/null || true)"
+      # Skip null-configDir default and backends.
+      if [[ -z "$dir" || "$kind" == "backend" ]]; then continue; fi
+      cr_relink_account "$a"
+      linked_count=$(( linked_count + 1 ))
+    done < <(cr_config_read | jq -r '.accounts[].name')
+    cr_say ""
+    cr_say "Relinked ${linked_count} account(s)."
+    cr_say "Shared from ${CR_CLAUDE_HOME}: ${CR_SHARE_PATHS[*]}."
+    cr_say "MCP servers merged from ${CR_CLAUDE_JSON} (identity left per-account)."
+    cr_say "Backups (if any) saved alongside as <name>.bak.<ts>."
+  }
+
+  case "$target" in
+    ""|--all)
+      _relink_all ;;
+    *)
+      cr_account_exists "$target" || cr_die "unknown account: $target (try: cr list)"
+      local kind; kind="$(cr_account_kind "$target")"
+      if [[ "$kind" == "backend" ]]; then
+        cr_die "'$target' is a backend — backends have no config dir to share into"
+      fi
+      local dir; dir="$(cr_account_dir "$target" 2>/dev/null || true)"
+      if [[ -z "$dir" ]]; then
+        cr_die "'$target' is the default account (null configDir) — it IS the source, nothing to relink"
+      fi
+      cr_relink_account "$target"
+      cr_say ""
+      cr_say "Shared from ${CR_CLAUDE_HOME}: ${CR_SHARE_PATHS[*]}."
+      cr_say "MCP servers merged from ${CR_CLAUDE_JSON} (identity left per-account)."
+      cr_say "Backups (if any) saved alongside as <name>.bak.<ts>."
+      ;;
+  esac
 }
 
 cr_cmd_login() {
@@ -998,6 +1043,7 @@ cr_cmd_help() {
   cmd "cr add-api <name>"          "register an Anthropic API key (explicit-only by default)"
   cmd "cr rotate <name> on|off"    "opt an api-key account in/out of rotation"
   cmd "cr register-default [name]" "adopt your existing ~/.claude login"
+  cmd "cr relink [--all|<name>]"   "re-share skills/agents/plugins/hooks/MCP from ~/.claude into account(s)"
   cmd "cr login / logout <name>"   "(re)authenticate / sign out an account"
   cmd "cr remove <name>"           "unregister an account"
   cmd "cr list"                    "show all accounts (alias: accounts, ls)"
@@ -1091,6 +1137,7 @@ main() {
     add-api)          shift; cr_cmd_add_api "$@" ;;
     rotate)           shift; cr_cmd_rotate "$@" ;;
     register-default) shift; cr_cmd_register_default "$@" ;;
+    relink)           shift; cr_cmd_relink "$@" ;;
     login)            shift; cr_cmd_login "$@" ;;
     logout)           shift; cr_cmd_logout "$@" ;;
     remove|rm)        shift; cr_cmd_remove "$@" ;;

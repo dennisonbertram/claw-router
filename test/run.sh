@@ -1652,6 +1652,289 @@ FAKECR3
   fi
 )
 
+# =========================================================================
+# relink tests — fully sandboxed, never touch real ~/.claude
+# =========================================================================
+
+# Fake claude home for relink tests (overrides CR_CLAUDE_HOME / CR_CLAUDE_JSON).
+FAKEHOME="$SBX/fakeclaudehome"
+mkdir -p "${FAKEHOME}/skills/s1" "${FAKEHOME}/agents/a1" "${FAKEHOME}/plugins/repos" \
+         "${FAKEHOME}/hooks" "${FAKEHOME}/workflows" "${FAKEHOME}/commands"
+printf 'x' > "${FAKEHOME}/settings.json"
+printf 'y' > "${FAKEHOME}/CLAUDE.md"
+printf '{"oauthAccount":{"emailAddress":"d@x"},"mcpServers":{"ctx7":{"command":"npx"},"linear":{"url":"x"}}}' \
+  > "$SBX/fake-claude.json"
+export CR_CLAUDE_HOME="$FAKEHOME"
+export CR_CLAUDE_JSON="$SBX/fake-claude.json"
+
+echo "== relink: shares dirs as symlinks, backs up real plugins =="
+(
+  export CR_HOME="$SBX/relink_home"
+  mkdir -p "$CR_HOME/logs"
+  WORK="$CR_HOME/accounts/work"
+  mkdir -p "$WORK"
+
+  # Seed config: subscription "work" (has a dir), null-default, and a backend.
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","configDir":null,"email":"a@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"work","configDir":"$WORK","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"deepseek","kind":"backend","configDir":null,"baseUrl":"https://api.deepseek.com/anthropic","model":"m","email":null,"plan":"backend","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+  # Put a REAL plugins/ dir in the work account with a marker file.
+  mkdir -p "$WORK/plugins"
+  printf 'real' > "$WORK/plugins/MARKER"
+
+  # Run relink.
+  "$CR" relink work 2>"$SBX/relink_err"; rc=$?
+  eq "relink work exits 0" "$rc" "0"
+
+  # skills, agents, hooks, workflows, commands, settings.json, CLAUDE.md should be symlinks.
+  for p in skills agents hooks commands settings.json CLAUDE.md; do
+    if [[ -L "$WORK/$p" ]]; then
+      tgt="$(readlink "$WORK/$p")"
+      if [[ "$tgt" == "$FAKEHOME/$p" ]]; then
+        ok "relink: $p is symlink → FAKEHOME"
+      else
+        bad "relink: $p symlink target" "expected $FAKEHOME/$p got $tgt"
+      fi
+    else
+      bad "relink: $p should be a symlink" "ls: $(ls -la "$WORK/$p" 2>&1)"
+    fi
+  done
+
+  # plugins should now be a symlink → FAKEHOME/plugins.
+  if [[ -L "$WORK/plugins" ]]; then
+    tgt="$(readlink "$WORK/plugins")"
+    if [[ "$tgt" == "$FAKEHOME/plugins" ]]; then
+      ok "relink: plugins is symlink → FAKEHOME/plugins"
+    else
+      bad "relink: plugins symlink target" "expected $FAKEHOME/plugins got $tgt"
+    fi
+  else
+    bad "relink: plugins should be a symlink now" "$(ls -la "$WORK/plugins" 2>&1)"
+  fi
+
+  # The old real plugins/ was backed up.
+  bak_count="$(find "$WORK" -maxdepth 1 -name 'plugins.bak.*' -type d 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$bak_count" -ge 1 ]]; then
+    ok "relink: old real plugins backed up"
+    # The backup still contains MARKER.
+    bak="$(find "$WORK" -maxdepth 1 -name 'plugins.bak.*' -type d 2>/dev/null | head -1)"
+    if grep -q 'real' "$bak/MARKER" 2>/dev/null; then
+      ok "relink: backup contains original MARKER content"
+    else
+      bad "relink: backup MARKER content" "bak dir=$bak"
+    fi
+  else
+    bad "relink: old real plugins should have been backed up" "bak files: $(ls -la "$WORK/" | grep bak || echo none)"
+  fi
+
+  # Idempotency: run relink again; no new .bak.* dirs created, symlinks unchanged.
+  "$CR" relink work 2>/dev/null
+  bak_count2="$(find "$WORK" -maxdepth 1 -name 'plugins.bak.*' -type d 2>/dev/null | wc -l | tr -d ' ')"
+  eq "relink idempotent: no extra bak dirs on second run" "$bak_count2" "$bak_count"
+  if [[ -L "$WORK/plugins" && "$(readlink "$WORK/plugins")" == "$FAKEHOME/plugins" ]]; then
+    ok "relink idempotent: plugins symlink unchanged"
+  else
+    bad "relink idempotent: plugins symlink changed" "$(ls -la "$WORK/plugins" 2>&1)"
+  fi
+
+  # Dangling-source: remove FAKEHOME/workflows; relink again; work/workflows must NOT become a dangling symlink.
+  rm -rf "$FAKEHOME/workflows"
+  "$CR" relink work 2>/dev/null
+  if [[ -L "$WORK/workflows" ]]; then
+    # If a symlink exists, its target must still exist (not dangling).
+    if [[ -e "$WORK/workflows" ]]; then
+      ok "relink dangling-source: workflows symlink exists and target is valid"
+    else
+      bad "relink dangling-source: workflows is a dangling symlink" "target=$(readlink "$WORK/workflows")"
+    fi
+  else
+    ok "relink dangling-source: no symlink created for missing source"
+  fi
+  # Restore workflows for later tests.
+  mkdir -p "$FAKEHOME/workflows"
+)
+
+echo "== relink: merges mcpServers, preserves identity =="
+(
+  export CR_HOME="$SBX/relink_mcp_home"
+  mkdir -p "$CR_HOME/logs"
+  WORK="$CR_HOME/accounts/work"
+  mkdir -p "$WORK"
+
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","configDir":"$WORK","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+  # Give work a .claude.json with its own mcp server, identity, and extra keys.
+  printf '{"oauthAccount":{"emailAddress":"work@x"},"mcpServers":{"local-only":{"command":"foo"}},"numStartups":5}' \
+    > "$WORK/.claude.json"
+
+  "$CR" relink work 2>/dev/null
+
+  # Identity preserved.
+  email="$(jq -r '.oauthAccount.emailAddress' "$WORK/.claude.json" 2>/dev/null)"
+  eq "relink mcp: oauthAccount.emailAddress preserved" "$email" "work@x"
+
+  # Extra keys preserved.
+  ns="$(jq -r '.numStartups' "$WORK/.claude.json" 2>/dev/null)"
+  eq "relink mcp: numStartups preserved" "$ns" "5"
+
+  # Shared servers merged in.
+  has_ctx7="$(jq -r '.mcpServers | has("ctx7")' "$WORK/.claude.json" 2>/dev/null)"
+  has_linear="$(jq -r '.mcpServers | has("linear")' "$WORK/.claude.json" 2>/dev/null)"
+  eq "relink mcp: ctx7 merged from source" "$has_ctx7" "true"
+  eq "relink mcp: linear merged from source" "$has_linear" "true"
+
+  # Account-only server preserved.
+  has_local="$(jq -r '.mcpServers | has("local-only")' "$WORK/.claude.json" 2>/dev/null)"
+  eq "relink mcp: local-only account server preserved" "$has_local" "true"
+
+  # Valid JSON.
+  if jq empty "$WORK/.claude.json" 2>/dev/null; then ok "relink mcp: .claude.json is valid JSON"; else bad "relink mcp: .claude.json invalid JSON" "$(cat "$WORK/.claude.json")"; fi
+
+  # Conflict: source wins. Overwrite ctx7 in work with different value, then relink.
+  jq '.mcpServers.ctx7 = {"command":"old-npx"}' "$WORK/.claude.json" > "$WORK/.claude.json.tmp" \
+    && mv "$WORK/.claude.json.tmp" "$WORK/.claude.json"
+  "$CR" relink work 2>/dev/null
+  ctx7_cmd="$(jq -r '.mcpServers.ctx7.command' "$WORK/.claude.json" 2>/dev/null)"
+  eq "relink mcp conflict: source wins (ctx7.command=npx not old-npx)" "$ctx7_cmd" "npx"
+)
+
+echo "== relink --all skips default + backend =="
+(
+  export CR_HOME="$SBX/relink_all_home"
+  mkdir -p "$CR_HOME/logs"
+  WORK="$CR_HOME/accounts/work"
+  API="$CR_HOME/accounts/api"
+  mkdir -p "$WORK" "$API"
+
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"default","configDir":null,"email":"a@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"work","configDir":"$WORK","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"apikey","kind":"api","configDir":"$API","apiKey":"sk-t","email":null,"plan":"api-key","lastUsed":0,"enabled":true,"usagePct":null,"rotate":true},
+  {"name":"deepseek","kind":"backend","configDir":null,"baseUrl":"https://api.deepseek.com/anthropic","model":"m","email":null,"plan":"backend","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+  "$CR" relink --all 2>"$SBX/relink_all_err"; rc=$?
+  eq "relink --all exits 0" "$rc" "0"
+
+  # work and api dirs got symlinks.
+  if [[ -L "$WORK/settings.json" ]]; then ok "relink --all: work/settings.json symlinked"; else bad "relink --all: work/settings.json not symlinked" "$(ls -la "$WORK/" 2>&1)"; fi
+  if [[ -L "$API/settings.json" ]]; then ok "relink --all: api/settings.json symlinked"; else bad "relink --all: api/settings.json not symlinked" "$(ls -la "$API/" 2>&1)"; fi
+
+  # No error touching default (null configDir) or backend.
+  if grep -qiE 'error|fail' "$SBX/relink_all_err" 2>/dev/null; then
+    # skip messages are fine; look for actual errors.
+    bad "relink --all: unexpected error in stderr" "$(cat "$SBX/relink_all_err")"
+  else
+    ok "relink --all: no errors in stderr"
+  fi
+
+  # Backend dir was not created.
+  if [[ -d "$CR_HOME/accounts/deepseek" ]]; then
+    bad "relink --all: backend dir should not have been created" "$CR_HOME/accounts/deepseek"
+  else
+    ok "relink --all: backend dir not created"
+  fi
+)
+
+echo "== relink: bad/missing target errors cleanly =="
+(
+  export CR_HOME="$SBX/relink_bad_home"
+  mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","configDir":"$SBX/relink_bad_home/accounts/work","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null},
+  {"name":"deepseek","kind":"backend","configDir":null,"baseUrl":"https://api.deepseek.com/anthropic","model":"m","email":null,"plan":"backend","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+  mkdir -p "$SBX/relink_bad_home/accounts/work"
+
+  # Nonexistent account exits nonzero with a clear message.
+  "$CR" relink nonexistent 2>"$SBX/relink_ne_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "relink nonexistent: exits nonzero"; else bad "relink nonexistent: should exit nonzero" "rc=$rc"; fi
+  if grep -qiE 'unknown|not found|nonexistent' "$SBX/relink_ne_err" 2>/dev/null; then ok "relink nonexistent: clear message"; else bad "relink nonexistent: no clear message" "$(cat "$SBX/relink_ne_err")"; fi
+
+  # Backend account exits nonzero with a clear message.
+  "$CR" relink deepseek 2>"$SBX/relink_be_err"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    ok "relink backend: exits nonzero"
+    if grep -qiE 'backend|config dir' "$SBX/relink_be_err" 2>/dev/null; then ok "relink backend: clear message"; else bad "relink backend: no clear message" "$(cat "$SBX/relink_be_err")"; fi
+  else
+    # Alternative: skip with a clear message (check for skip/backend in stderr).
+    if grep -qiE 'skip|backend' "$SBX/relink_be_err" 2>/dev/null; then ok "relink backend: exits 0 with skip message"; else bad "relink backend: should exit nonzero or print clear message" "rc=$rc stderr=$(cat "$SBX/relink_be_err")"; fi
+  fi
+)
+
+echo "== relink: missing/empty source + missing acct json =="
+(
+  export CR_HOME="$SBX/relink_empty_home"
+  mkdir -p "$CR_HOME/logs"
+  WORK="$CR_HOME/accounts/work"
+  mkdir -p "$WORK"
+
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[
+  {"name":"work","configDir":"$WORK","email":"b@x","plan":"max","lastUsed":0,"enabled":true,"usagePct":null}],
+ "rotation":{"cursor":0},"share":{}}
+JSON
+
+  # Source .claude.json has no mcpServers → relink exits 0, work/.claude.json absent is fine.
+  ORIG_JSON="$CR_CLAUDE_JSON"
+  printf '{"oauthAccount":{"emailAddress":"d@x"}}' > "$SBX/no-mcp-claude.json"
+  CR_CLAUDE_JSON="$SBX/no-mcp-claude.json" "$CR" relink work 2>/dev/null; rc=$?
+  eq "relink empty source mcp: exits 0" "$rc" "0"
+  # work has no .claude.json yet — that's fine.
+  if [[ ! -f "$WORK/.claude.json" ]]; then ok "relink: no .claude.json → skip merge cleanly"; fi
+
+  # With work having no .claude.json but the source has mcp: dirs still linked, merge skipped.
+  CR_CLAUDE_JSON="$CR_CLAUDE_JSON" "$CR" relink work 2>/dev/null; rc2=$?
+  eq "relink: links dirs even without work/.claude.json, exits 0" "$rc2" "0"
+  if [[ -L "$WORK/settings.json" ]]; then ok "relink: settings.json symlinked despite no .claude.json"; else bad "relink: settings.json not symlinked" "$(ls -la "$WORK/" 2>&1)"; fi
+)
+
+echo "== cr add: merges mcpServers after registering the account (ordering) =="
+(
+  export CR_HOME="$SBX/add_mcp_home"
+  mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[],"rotation":{"cursor":0},"share":{}}
+JSON
+  # Fake claude whose /login writes a .claude.json with its OWN identity into the dir.
+  LOGINBIN="$SBX/add_mcp_bin"; mkdir -p "$LOGINBIN"
+  cat > "$LOGINBIN/claude" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "/login" ]]; then
+  printf '{"oauthAccount":{"emailAddress":"new@x","organizationType":"max"},"mcpServers":{"local-only":{"command":"foo"}},"numStartups":3}' \
+    > "${CLAUDE_CONFIG_DIR}/.claude.json"
+fi
+exit 0
+EOF
+  chmod +x "$LOGINBIN/claude"
+  # Source has two shared servers; the new account should end up with both + its own.
+  printf '{"oauthAccount":{"emailAddress":"d@x"},"mcpServers":{"ctx7":{"command":"npx"},"linear":{"url":"x"}}}' > "$SBX/add-src-claude.json"
+
+  PATH="$LOGINBIN:$PATH" CR_CLAUDE_JSON="$SBX/add-src-claude.json" "$CR" add newacct >/dev/null 2>&1
+  AJ="$CR_HOME/accounts/newacct/.claude.json"
+  if [[ -f "$AJ" ]]; then ok "cr add: account .claude.json created"; else bad "cr add: .claude.json missing" "$(ls -la "$CR_HOME/accounts/newacct/" 2>&1)"; fi
+  # Shared servers merged in (the ordering bug made this silently skip):
+  eq "cr add: shared mcp 'ctx7' merged"   "$(jq -r '.mcpServers.ctx7.command // "MISSING"' "$AJ" 2>/dev/null)" "npx"
+  eq "cr add: shared mcp 'linear' merged"  "$(jq -r '.mcpServers.linear.url // "MISSING"' "$AJ" 2>/dev/null)" "x"
+  # Account-only server preserved, identity + other keys untouched:
+  eq "cr add: account-only mcp preserved"  "$(jq -r '.mcpServers["local-only"].command // "MISSING"' "$AJ" 2>/dev/null)" "foo"
+  eq "cr add: account identity preserved"  "$(jq -r '.oauthAccount.emailAddress' "$AJ" 2>/dev/null)" "new@x"
+  eq "cr add: other keys preserved"        "$(jq -r '.numStartups' "$AJ" 2>/dev/null)" "3"
+)
+
 echo
 PASS=$(wc -c < "$SBX/.pass" | tr -d ' '); FAIL=$(wc -c < "$SBX/.fail" | tr -d ' ')
 echo "== $PASS passed, $FAIL failed =="
