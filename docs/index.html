@@ -271,7 +271,7 @@ cr config watch-idle 30      <span class="c"># only move after 30s of quiet</spa
           <tr><th scope="row">cr policy &lt;p&gt;</th><td><code>round-robin</code> · <code>lru</code> · <code>random</code> · <code>usage-aware</code>.</td></tr>
           <tr><th scope="row">cr config [key val]</th><td>Tune the knobs: <code>exhausted-at</code>, <code>ttl</code>, <code>auto-refresh</code>, <code>watch-at</code>, <code>watch-interval</code>, <code>watch-idle</code>.</td></tr>
           <tr><th scope="row">cr usage [name]</th><td>Per-window meters with reset countdowns.</td></tr>
-          <tr><th scope="row">cr status [--refresh]</th><td>Dashboard: next pick, plus per-account usage bars.</td></tr>
+          <tr><th scope="row">cr status [--refresh·--json]</th><td>Dashboard or JSON: next pick, plus per-account usage.</td></tr>
           <tr><th scope="row">cr doctor [name]</th><td>Verify each account’s directory and Keychain credential.</td></tr>
           <tr><th scope="row">cr add-api &lt;name&gt;</th><td>Register an Anthropic API key — explicit-only by default.</td></tr>
           <tr><th scope="row">cr rotate &lt;name&gt; on·off</th><td>Opt an api-key account in or out of the rotation.</td></tr>
@@ -286,7 +286,7 @@ cr config watch-idle 30      <span class="c"># only move after 30s of quiet</spa
   <section class="aboard" id="aboard">
     <div class="aboard__inner">
       <h2 class="section-head">Also aboard.</h2>
-      <p class="section-sub">Four more things the router carries, for the days you need them.</p>
+      <p class="section-sub">Five more things the router carries, for the days you need them.</p>
 
       <div class="aboard-row">
         <h3>An API key, on a leash.<small>cr add-api work-key</small></h3>
@@ -313,6 +313,13 @@ cr config watch-idle 30      <span class="c"># only move after 30s of quiet</spa
         <h3>Sessions that follow you.<small>cr --resume &lt;id&gt;</small></h3>
         <div>
           <p>Claude&nbsp;Code stores each conversation under the account that created it. <code>cr --resume</code> just works: whichever account the rotation picks, <code>cr</code> transparently links the session in from the account that owns it. You never see “No conversation found” again.</p>
+        </div>
+      </div>
+
+      <div class="aboard-row">
+        <h3>A watcher in your menu bar.<small>menubar/clawrouter.30s.sh</small></h3>
+        <div>
+          <p>A small <a href="https://github.com/swiftbar/SwiftBar">SwiftBar</a> plugin puts your headroom in the macOS menu bar — <code>🦞 58%</code>, the least-free of your accounts, colored by how much is left. The dropdown breaks it down per account and window with reset countdowns, and switches policy or pins an account in a click. It reads the cached snapshot through a new <code>cr status --json</code>, so it draws instantly and only refreshes when the cache goes stale. Pour yourself a coffee; it’ll tell you which plan to lean on.</p>
         </div>
       </div>
     </div>

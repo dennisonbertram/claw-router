@@ -122,7 +122,7 @@ Manage (never forwarded to claude):
 | `cr use --clear` (`cr unuse`) | un-pin; go back to the rotation policy |
 | `cr policy <p>` | `round-robin` \| `lru` \| `random` \| `usage-aware` |
 | `cr usage [name]` | show usage meters per window (`--plain` for one-line text) |
-| `cr status [--refresh]` | dashboard: next pick + per-account usage bars (cached; `--refresh` polls live) |
+| `cr status [--refresh\|--json]` | dashboard or machine-readable JSON: next pick + per-account usage (cached; `--refresh` polls live) |
 | `cr doctor [name]` | verify each account's dir + keychain credential |
 
 ## Selection policies
@@ -292,6 +292,42 @@ Bypasses (watch silently degrades and runs normally):
 - Only one enabled subscription account — nowhere to hand off to.
 
 `--watch` composes with `--sandbox` (best-effort: both flags are independent).
+
+## Menu bar watcher
+
+A small [SwiftBar](https://github.com/swiftbar/SwiftBar) (or xbar) plugin lives in
+[`menubar/`](menubar/) — it sits in your macOS menu bar and shows, at a glance,
+how much headroom each subscription has, so you know which one to lean on before
+you even start a session.
+
+```sh
+brew install --cask swiftbar      # or: brew install --cask xbar
+brew install jq                   # if you don't already have it
+mkdir -p ~/.config/swiftbar
+ln -s "$PWD/menubar/clawrouter.30s.sh" ~/.config/swiftbar/
+# point SwiftBar at ~/.config/swiftbar on first launch, then enable the plugin
+```
+
+The bar shows the binding constraint — the *least* headroom across your in-rotation
+accounts (`🦞 58%`, colored by how much is left). The dropdown breaks it down per
+account and per window with reset countdowns, and gives you one-click actions to
+switch policy, pin an account, or force a refresh. When an in-rotation account
+crosses the exhaustion threshold it fires a single macOS notification.
+
+It reads the cached snapshot via the new `cr status --json` for instant draws, and
+only refreshes in the background when a subscription's cache is stale (respecting
+`cr config ttl`). See [`menubar/README.md`](menubar/README.md) for configuration
+(`CLAWROUTER_CR`, `CLAWROUTER_NOTIFY`), an optional `launchd` cache-warmer, and
+troubleshooting.
+
+`cr status --json` is also useful on its own — a machine-readable usage snapshot
+(policy, next pick, per-account/per-window headroom, exhaustion, staleness) you can
+pipe into your own tools:
+
+```sh
+cr status --json            # cached snapshot, instant, no network
+cr status --json --refresh  # poll live first, then emit
+```
 
 ## Sessions across accounts
 
