@@ -212,8 +212,17 @@ for ((i=0; i<acct_count; i++)); do
       wbar="$(make_bar "$wleft")"
       wcolor="$(left_color_param "$wleft")"
 
-      # Compact label: shorten "5h session" → "5h", "7d total" → "7d", etc.
-      short_label="$(printf '%s' "$wlabel" | awk '{print $1}')"
+      # Compact label, kept UNIQUE so the three 7d windows don't all read "7d".
+      # Pre-padded to a fixed display width (4 cols) here, since · is multibyte
+      # and would confuse printf %-Ns padding.
+      case "$wlabel" in
+        "5h session") short_label="5h  " ;;
+        "7d total")   short_label="7d  " ;;
+        "7d Opus")    short_label="7dO " ;;
+        "7d Sonnet")  short_label="7dS " ;;
+        "7d Haiku")   short_label="7dH " ;;
+        *)            short_label="$(printf '%-4s' "$(printf '%s' "$wlabel" | awk '{print $1}')")" ;;
+      esac
 
       # Reset countdown.
       reset_str=""
@@ -222,7 +231,7 @@ for ((i=0; i<acct_count; i++)); do
         [[ -n "$rdelta" ]] && reset_str=" · ${rdelta}"
       fi
 
-      printf '  %-4s %s %s%%%s | font=Menlo size=12 %s\n' \
+      printf '  %s %s %s%%%s | font=Menlo size=12 %s\n' \
         "$short_label" "$wbar" "$wleft" "$reset_str" "$wcolor"
     done
   fi

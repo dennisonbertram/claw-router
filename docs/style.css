@@ -508,6 +508,15 @@ img, svg { max-width: 100%; height: auto; display: block; }
 
 .cta-close { padding-bottom: var(--space-2xl); }
 .cta-close__inner { max-width: 68rem; }
+.cta-close__mark {
+  display: block;
+  width: 100%;
+  max-width: 44rem;
+  height: auto;
+  margin: 0 0 var(--space-xl);
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--ink) 8%, transparent);
+}
 .cta-close .section-head { max-width: 18ch; }
 .cta-close .codeblock { margin-top: var(--space-xl); }
 .cta-close__links {
