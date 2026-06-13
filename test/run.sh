@@ -132,6 +132,17 @@ JSON
 run_cr -p x
 eq "single account is chosen" "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/solo"
 
+echo "== plain 'cr' with NO args launches (bash 3.2 empty-array guard) =="
+# Regression: on macOS stock bash 3.2 under set -u, `set -- "${_rest[@]}"` with
+# no claude args was an "unbound variable" error — plain `cr` died before launch.
+seed
+: > "$FAKE_OUT"
+"$CR" >"$SBX/stdout" 2>"$SBX/stderr"; rc=$?
+eq "plain cr exits 0 (no unbound-variable crash)" "$rc" "0"
+if grep -q 'unbound variable' "$SBX/stderr"; then bad "plain cr: no unbound-variable error" "$(cat "$SBX/stderr")"; else ok "plain cr: no unbound-variable error"; fi
+if grep -q '^CONFIG_DIR=' "$FAKE_OUT"; then ok "plain cr reaches launch (execs claude)"; else bad "plain cr reaches launch" "fake claude not invoked: $(cat "$FAKE_OUT")"; fi
+eq "plain cr forwards NO args to claude" "$(grep '^ARGS=' "$FAKE_OUT")" "ARGS="
+
 echo "== usage pct parsing (unit) =="
 ( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
   j='{"five_hour":{"utilization":42},"seven_day":{"utilization":61},"seven_day_opus":{"utilization":12}}'

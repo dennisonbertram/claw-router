@@ -927,7 +927,11 @@ main() {
     [[ "$_a" == "--" ]] && _seen_sep=1
     _rest+=("$_a")
   done
-  set -- "${_rest[@]}"
+  # Guard the empty-array expansion: on bash 3.2 (macOS stock) under `set -u`,
+  # a bare "${_rest[@]}" with no elements is an "unbound variable" error — which
+  # is exactly the no-arg `cr` case. The ${arr[@]+…} form expands to nothing
+  # when empty instead of erroring.
+  set -- ${_rest[@]+"${_rest[@]}"}
   # Fail fast on --sandbox without cco, before any banner/launch side effects.
   if [[ "$CR_SANDBOX" == 1 ]] && ! command -v cco >/dev/null 2>&1; then
     cr_die "--sandbox needs 'cco' (not found). Install it:
