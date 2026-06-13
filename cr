@@ -767,15 +767,33 @@ cr_cmd_adopt() {
 
 cr_cmd_status() {
   cr_ensure_home
+
+  # Parse flags in any order: --refresh / -r and --json (any combination).
+  local want_json=0 do_refresh=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --refresh|-r) do_refresh=1; shift ;;
+      --json)       want_json=1; shift ;;
+      *)            cr_die "cr status: unknown flag '$1' (--refresh, --json)" ;;
+    esac
+  done
+
   # Optional: refresh live usage before drawing (otherwise use cached snapshot).
-  if [[ "${1:-}" == "--refresh" || "${1:-}" == "-r" ]]; then
+  # In --json mode we suppress the human "refreshing" line (send nothing to stdout).
+  if [[ "$do_refresh" -eq 1 ]]; then
     if cr_have curl; then
-      cr_say "${C_DIM}refreshing usage…${C_RESET}"
+      [[ "$want_json" -eq 0 ]] && cr_say "${C_DIM}refreshing usage…${C_RESET}"
       local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_subscription_accounts)
     else
       cr_warn "curl not found — showing cached usage"
     fi
   fi
+
+  if [[ "$want_json" -eq 1 ]]; then
+    cr_emit_status_json
+    return 0
+  fi
+
   local policy def n
   policy="$(cr_config_read | jq -r '.selection // "round-robin"')"
   def="$(cr_config_read | jq -r '.defaultAccount // empty')"
@@ -804,6 +822,105 @@ cr_cmd_status() {
     printf '  %sno usage cached yet — run %scr usage%s%s or %scr status --refresh%s\n\n' \
       "$C_DIM" "$C_CYAN" "$C_RESET$C_DIM" "" "$C_CYAN" "$C_RESET" >&2
   fi
+}
+
+# Emit a single JSON object to stdout describing the current routing state.
+# Reads ONLY cached config — no network. Called by cr_cmd_status when --json is set.
+# Schema version 1: bump when fields change in a breaking way.
+cr_emit_status_json() {
+  local cfg generated_at now_s policy pinned exhausted_pct ttl_s
+  cfg="$(cr_config_read)"
+  generated_at="$(date -u +%FT%TZ)"
+  now_s="$(date +%s)"
+  policy="$(printf '%s' "$cfg" | jq -r '.selection // "round-robin"')"
+  pinned="$(printf '%s' "$cfg" | jq -r '.defaultAccount // empty')"
+  exhausted_pct="$(printf '%s' "$cfg" | jq -r '.exhaustedAtPct // 100')"
+  ttl_s="$(printf '%s' "$cfg" | jq -r '.usageTtlSeconds // 900')"
+
+  # Compute next pick WITHOUT advancing the round-robin cursor.
+  # cr_select_lru and cr_select_usage_aware are pure reads; safe to call.
+  # cr_select_round_robin advances the cursor — must NOT be called here.
+  local next_name="" next_note=""
+  if [[ -n "$pinned" ]]; then
+    next_name="$pinned"
+    next_note="pinned via 'cr use'"
+  elif [[ "$policy" == lru ]]; then
+    next_name="$(cr_select_lru 2>/dev/null || true)"
+    next_note="would pick now"
+  elif [[ "$policy" == usage-aware ]]; then
+    next_name="$(cr_select_usage_aware 2>/dev/null || true)"
+    next_note="most headroom"
+  elif [[ "$policy" == random ]]; then
+    next_name=""
+    next_note="picked randomly at launch"
+  else
+    next_name=""
+    next_note="next in rotation — run a plain 'cr' to advance"
+  fi
+
+  printf '%s' "$cfg" | jq -S \
+    --arg schema       "1" \
+    --arg generatedAt  "$generated_at" \
+    --arg policy       "$policy" \
+    --arg pinned       "$pinned" \
+    --argjson exhaustedAtPct "$exhausted_pct" \
+    --argjson ttlSeconds     "$ttl_s" \
+    --arg nextName     "$next_name" \
+    --arg nextNote     "$next_note" \
+    --argjson nowS     "$now_s" \
+    '
+    {
+      schema: ($schema | tonumber),
+      generatedAt: $generatedAt,
+      policy: $policy,
+      pinned: (if $pinned == "" then null else $pinned end),
+      exhaustedAtPct: $exhaustedAtPct,
+      ttlSeconds: $ttlSeconds,
+      next: {
+        name: (if $nextName == "" then null else $nextName end),
+        note: $nextNote
+      },
+      accounts: [
+        .accounts[] |
+        . as $acct |
+        ($acct.kind // "subscription") as $kind |
+        (if   $kind == "subscription" then true
+         elif $kind == "api" then ($acct.rotate == true)
+         else false
+         end) as $rotate |
+        (($acct.enabled != false) and (
+          $kind == "subscription" or ($kind == "api" and $rotate)
+        )) as $inRotation |
+        ($acct.usagePct) as $usagePct |
+        (($usagePct != null) and ($usagePct >= $exhaustedAtPct)) as $exhausted |
+        (($acct.usage.checkedAt // null) | if . then (. / 1000 | todate) else null end) as $checkedAt |
+        ($checkedAt == null or (($nowS - ($acct.usage.checkedAt // 0) / 1000) > $ttlSeconds)) as $stale |
+        {
+          name: $acct.name,
+          kind: $kind,
+          email: ($acct.email // null),
+          enabled: ($acct.enabled != false),
+          rotate: $rotate,
+          inRotation: $inRotation,
+          usagePct: $usagePct,
+          exhausted: $exhausted,
+          checkedAt: $checkedAt,
+          stale: $stale,
+          windows: [
+            ($acct.usage.windows // [])[] |
+            ( (.used + 0.5 | floor) | if . < 0 then 0 elif . > 100 then 100 else . end ) as $usedInt |
+            ( (100 - .used + 0.5 | floor) | if . < 0 then 0 elif . > 100 then 100 else . end ) as $leftInt |
+            {
+              label: .label,
+              usedPct: $usedInt,
+              leftPct: $leftInt,
+              resetsAt: (.resets // null)
+            }
+          ]
+        }
+      ]
+    }
+    '
 }
 
 cr_doctor() {
@@ -875,7 +992,7 @@ cr_cmd_help() {
   cmd "cr use <name>"              "pin the account a plain 'cr' uses"
   cmd "cr use --clear  (unuse)"    "unpin; return to the rotation policy"
   cmd "cr config [key val]"        "tune exhausted-at / auto-refresh / ttl / watch-at / …"
-  cmd "cr status [--refresh]"      "dashboard: next pick + per-account usage bars"
+  cmd "cr status [--refresh|--json]" "dashboard / machine-readable usage (cached; --refresh polls live)"
 
   head "Sessions"
   cmd "cr adopt <id> <account>"    "manually link a session into <account> (--resume does this automatically)"

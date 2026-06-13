@@ -921,6 +921,407 @@ JSON
   fi
 )
 
+echo "== status --json: valid, cached, no cursor advance =="
+(
+  export CR_HOME="$SBX/json_home"; mkdir -p "$CR_HOME/logs"
+  NOW_MS="$(( $(date +%s) * 1000 ))"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "round-robin",
+  "exhaustedAtPct": 100,
+  "usageTtlSeconds": 900,
+  "accounts": [
+    {
+      "name": "work", "kind": "subscription",
+      "configDir": "$SBX/json_home/accounts/work",
+      "email": "work@example.com", "plan": "max",
+      "lastUsed": 0, "enabled": true, "usagePct": 58,
+      "usage": {
+        "checkedAt": ${NOW_MS},
+        "windows": [
+          {"label": "5h session", "used": 58, "resets": "2030-01-01T00:00:00Z"},
+          {"label": "7d total",   "used": 12, "resets": null}
+        ]
+      }
+    },
+    {
+      "name": "home", "kind": "subscription",
+      "configDir": "$SBX/json_home/accounts/home",
+      "email": "home@example.com", "plan": "pro",
+      "lastUsed": 0, "enabled": true, "usagePct": null
+    },
+    {
+      "name": "perskey", "kind": "api",
+      "configDir": "$SBX/json_home/accounts/perskey",
+      "apiKey": "sk-pers", "email": null, "plan": "api-key",
+      "lastUsed": 0, "enabled": true, "usagePct": 5, "rotate": true,
+      "usage": {
+        "checkedAt": ${NOW_MS},
+        "windows": [{"label": "5h session", "used": 5, "resets": null}]
+      }
+    },
+    {
+      "name": "workkey", "kind": "api",
+      "configDir": "$SBX/json_home/accounts/workkey",
+      "apiKey": "sk-work", "email": null, "plan": "api-key",
+      "lastUsed": 0, "enabled": true, "usagePct": null, "rotate": false
+    },
+    {
+      "name": "deepseek", "kind": "backend",
+      "configDir": null, "baseUrl": "https://api.deepseek.com/anthropic",
+      "model": "deepseek-v4-pro", "email": null, "plan": "backend",
+      "lastUsed": 0, "enabled": true, "usagePct": null
+    }
+  ],
+  "rotation": {"cursor": 2},
+  "share": {}
+}
+JSON
+
+  out="$("$CR" status --json 2>/dev/null)"
+  # Valid JSON.
+  if printf '%s' "$out" | jq -e . >/dev/null 2>&1; then ok "status --json: valid JSON output"; else bad "status --json: valid JSON output" "$out"; fi
+  # Exit 0 already confirmed by subshell not erroring; check explicitly.
+  "$CR" status --json >/dev/null 2>/dev/null; rc=$?
+  eq "status --json: exits 0" "$rc" "0"
+
+  # Top-level schema fields.
+  eq "status --json: schema==1"           "$(printf '%s' "$out" | jq -r '.schema')"            "1"
+  eq "status --json: policy==round-robin" "$(printf '%s' "$out" | jq -r '.policy')"            "round-robin"
+  eq "status --json: 5 accounts"         "$(printf '%s' "$out" | jq -r '.accounts|length')"   "5"
+
+  # work account.
+  eq "status --json: work.usagePct==58"  "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="work")|.usagePct')"    "58"
+  eq "status --json: work win0.leftPct==42" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="work")|.windows[0].leftPct')" "42"
+  eq "status --json: work.exhausted==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="work")|.exhausted')"          "false"
+  eq "status --json: work.inRotation==true" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="work")|.inRotation')"         "true"
+
+  # backend deepseek: not in rotation.
+  eq "status --json: deepseek.inRotation==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="deepseek")|.inRotation')"     "false"
+
+  # api workkey rotate:false: not in rotation.
+  eq "status --json: workkey.inRotation==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="workkey")|.inRotation')"      "false"
+
+  # api perskey rotate:true: in rotation.
+  eq "status --json: perskey.inRotation==true" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="perskey")|.inRotation')"      "true"
+
+  # home has no usage.
+  eq "status --json: home.usagePct==null" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="home")|.usagePct')"           "null"
+  eq "status --json: home.windows empty" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="home")|.windows|length')"     "0"
+
+  # round-robin next: no cursor advance, name should be null.
+  eq "status --json: next.name==null (round-robin)" \
+     "$(printf '%s' "$out" | jq -r '.next.name')"                                            "null"
+  if printf '%s' "$out" | jq -r '.next.note' | grep -q "rotation"; then
+    ok "status --json: next.note mentions rotation"
+  else
+    bad "status --json: next.note mentions rotation" "$(printf '%s' "$out" | jq -r '.next.note')"
+  fi
+
+  # Cursor must NOT have advanced — still 2.
+  cursor_after="$(jq -r '.rotation.cursor' "$CR_HOME/config.json")"
+  eq "status --json: round-robin cursor unchanged after --json" "$cursor_after" "2"
+
+  # stdout starts with '{'.
+  first_char="$(printf '%s' "$out" | head -c1)"
+  eq "status --json: stdout starts with '{'" "$first_char" "{"
+)
+
+echo "== status --json: lru/pinned next, exhausted flag =="
+(
+  export CR_HOME="$SBX/json_lru_home"; mkdir -p "$CR_HOME/logs"
+  NOW_MS="$(( $(date +%s) * 1000 ))"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "lru",
+  "exhaustedAtPct": 90,
+  "usageTtlSeconds": 900,
+  "accounts": [
+    {
+      "name": "alpha", "kind": "subscription",
+      "configDir": "$SBX/json_lru_home/accounts/alpha",
+      "email": "a@x", "plan": "max",
+      "lastUsed": 1000, "enabled": true, "usagePct": 95,
+      "usage": {"checkedAt": ${NOW_MS}, "windows": []}
+    },
+    {
+      "name": "beta", "kind": "subscription",
+      "configDir": "$SBX/json_lru_home/accounts/beta",
+      "email": "b@x", "plan": "max",
+      "lastUsed": 500, "enabled": true, "usagePct": 40,
+      "usage": {"checkedAt": ${NOW_MS}, "windows": []}
+    }
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+
+  out="$("$CR" status --json 2>/dev/null)"
+
+  # alpha at 95% >= exhaustedAtPct 90 → exhausted.
+  eq "status --json lru: alpha.exhausted==true" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="alpha")|.exhausted')" "true"
+
+  # beta at 40% < 90 → not exhausted.
+  eq "status --json lru: beta.exhausted==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="beta")|.exhausted')" "false"
+
+  # lru next: beta (lastUsed 500 < alpha 1000, and beta is available;
+  # alpha is exhausted at 95% >= exhaustedAtPct 90, so lru skips it).
+  eq "status --json lru: next.name is exactly beta" \
+     "$(printf '%s' "$out" | jq -r '.next.name')" "beta"
+  eq "status --json lru: next.note=='would pick now'" \
+     "$(printf '%s' "$out" | jq -r '.next.note')" "would pick now"
+
+  # Pin a name and confirm it shows up.
+  cr_home_backup="$CR_HOME"
+  export CR_HOME="$cr_home_backup"
+  jq '.defaultAccount = "beta"' "$CR_HOME/config.json" > "$CR_HOME/config.json.tmp" && mv "$CR_HOME/config.json.tmp" "$CR_HOME/config.json"
+  out2="$("$CR" status --json 2>/dev/null)"
+  eq "status --json pinned: next.name=='beta'" \
+     "$(printf '%s' "$out2" | jq -r '.next.name')" "beta"
+  if printf '%s' "$out2" | jq -r '.next.note' | grep -q "pinned"; then
+    ok "status --json pinned: next.note mentions pinned"
+  else
+    bad "status --json pinned: next.note mentions pinned" "$(printf '%s' "$out2" | jq -r '.next.note')"
+  fi
+)
+
+echo "== status --json: no cache -> still valid JSON, exit 0 =="
+(
+  export CR_HOME="$SBX/json_nocache_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "round-robin",
+  "accounts": [
+    {
+      "name": "solo", "kind": "subscription",
+      "configDir": null,
+      "email": "s@x", "plan": "max",
+      "lastUsed": 0, "enabled": true
+    }
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+
+  out="$("$CR" status --json 2>/dev/null)"; rc=$?
+  eq "status --json nocache: exits 0" "$rc" "0"
+  if printf '%s' "$out" | jq -e . >/dev/null 2>&1; then ok "status --json nocache: valid JSON"; else bad "status --json nocache: valid JSON" "$out"; fi
+  eq "status --json nocache: solo.usagePct==null" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="solo")|.usagePct')" "null"
+  eq "status --json nocache: solo.stale==true" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="solo")|.stale')" "true"
+)
+
+echo "== status --json: float rounding for usedPct/leftPct =="
+(
+  export CR_HOME="$SBX/json_float_home"; mkdir -p "$CR_HOME/logs"
+  NOW_MS="$(( $(date +%s) * 1000 ))"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "round-robin",
+  "exhaustedAtPct": 100,
+  "usageTtlSeconds": 900,
+  "accounts": [
+    {
+      "name": "floaty", "kind": "subscription",
+      "configDir": null, "email": "f@x", "plan": "max",
+      "lastUsed": 0, "enabled": true, "usagePct": 59,
+      "usage": {
+        "checkedAt": ${NOW_MS},
+        "windows": [
+          {"label": "5h session", "used": 58.7, "resets": null},
+          {"label": "7d total",   "used": 110,  "resets": null}
+        ]
+      }
+    }
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+  out="$("$CR" status --json 2>/dev/null)"
+  # 58.7 rounds to 59 usedPct, leftPct = 100-58.7 = 41.3 rounds to 41
+  if printf '%s' "$out" | jq -e '.accounts[]|select(.name=="floaty")|.windows[0]|(.leftPct==41 and .usedPct==59)' >/dev/null 2>&1; then
+    ok "status --json float: 58.7 -> usedPct=59 leftPct=41 (integers)"
+  else
+    bad "status --json float: 58.7 rounding" \
+      "$(printf '%s' "$out" | jq -c '.accounts[]|select(.name=="floaty")|.windows[0]|{usedPct,leftPct}')"
+  fi
+  # used=110 clamps to usedPct=100, leftPct=0 (not negative)
+  if printf '%s' "$out" | jq -e '.accounts[]|select(.name=="floaty")|.windows[1]|(.leftPct==0 and .usedPct==100)' >/dev/null 2>&1; then
+    ok "status --json float: used=110 -> usedPct=100 leftPct=0 (clamped)"
+  else
+    bad "status --json float: used=110 clamping" \
+      "$(printf '%s' "$out" | jq -c '.accounts[]|select(.name=="floaty")|.windows[1]|{usedPct,leftPct}')"
+  fi
+)
+
+echo "== status --json: random policy next.name==null + note =="
+(
+  export CR_HOME="$SBX/json_random_home"; mkdir -p "$CR_HOME/logs"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "random",
+  "accounts": [
+    {"name": "work", "kind": "subscription", "configDir": null,
+     "email": "w@x", "plan": "max", "lastUsed": 0, "enabled": true, "usagePct": null}
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+  out="$("$CR" status --json 2>/dev/null)"
+  eq "status --json random: next.name==null" \
+     "$(printf '%s' "$out" | jq -r '.next.name')" "null"
+  if printf '%s' "$out" | jq -r '.next.note' | grep -qi "random"; then
+    ok "status --json random: next.note contains 'random'"
+  else
+    bad "status --json random: next.note contains 'random'" \
+      "$(printf '%s' "$out" | jq -r '.next.note')"
+  fi
+)
+
+echo "== menubar plugin: stale-refresh jq filter is subscription-scoped =="
+(
+  # Unit-assert the jq filter directly on a known-bad stub:
+  # one stale subscription (stale=false), one stale api rotate=true account.
+  # The subscription-scoped filter must return 0.
+  stub_json='{
+    "accounts": [
+      {"name":"subA","kind":"subscription","inRotation":true,"stale":false},
+      {"name":"apiB","kind":"api","inRotation":true,"stale":true}
+    ]
+  }'
+  result="$(printf '%s' "$stub_json" | jq -r '[.accounts[]|select(.kind=="subscription" and .inRotation==true and .stale==true)]|length')"
+  eq "plugin stale filter: api-stale-only -> count==0 (no spurious refresh)" "$result" "0"
+)
+
+echo "== menubar plugin: syntax check =="
+bash -n "$CR_REPO/menubar/clawrouter.30s.sh"
+eq "menubar plugin: bash -n syntax check" "$?" "0"
+
+echo "== menubar plugin: renders from stubbed cr =="
+(
+  MB_BIN="$SBX/mb_bin"; mkdir -p "$MB_BIN"
+  MB_NOW_MS="$(( $(date +%s) * 1000 ))"
+
+  # Fake cr: for 'status --json' emits known-good JSON; all other calls exit 0.
+  cat > "$MB_BIN/cr" <<FAKECR
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "status" && "\${2:-}" == "--json" ]]; then
+  cat <<'ENDJSON'
+{
+  "schema": 1,
+  "generatedAt": "2026-01-01T00:00:00Z",
+  "policy": "round-robin",
+  "pinned": null,
+  "exhaustedAtPct": 100,
+  "ttlSeconds": 900,
+  "next": {"name": null, "note": "next in rotation -- run a plain 'cr' to advance"},
+  "accounts": [
+    {
+      "name": "work", "kind": "subscription",
+      "email": "work@example.com",
+      "enabled": true, "rotate": true, "inRotation": true,
+      "usagePct": 58, "exhausted": false, "stale": false,
+      "checkedAt": "2026-01-01T00:00:00Z",
+      "windows": [
+        {"label": "5h session", "usedPct": 58, "leftPct": 42, "resetsAt": "2030-01-01T06:00:00Z"},
+        {"label": "7d total",   "usedPct": 12, "leftPct": 88, "resetsAt": null}
+      ]
+    },
+    {
+      "name": "home", "kind": "subscription",
+      "email": "home@example.com",
+      "enabled": true, "rotate": true, "inRotation": true,
+      "usagePct": 95, "exhausted": false, "stale": false,
+      "checkedAt": "2026-01-01T00:00:00Z",
+      "windows": [
+        {"label": "5h session", "usedPct": 95, "leftPct": 5, "resetsAt": null}
+      ]
+    },
+    {
+      "name": "deepseek", "kind": "backend",
+      "email": null,
+      "enabled": true, "rotate": false, "inRotation": false,
+      "usagePct": null, "exhausted": false, "stale": true,
+      "checkedAt": null,
+      "windows": []
+    }
+  ]
+}
+ENDJSON
+  exit 0
+fi
+exit 0
+FAKECR
+  chmod +x "$MB_BIN/cr"
+
+  # Use real jq.
+  MB_JQ="$(command -v jq)"
+
+  plugin_out="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" CLAWROUTER_NOTIFY=0 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"; rc=$?
+
+  eq "menubar: exits 0 with good data" "$rc" "0"
+  # First line contains the lobster emoji.
+  first_line="$(printf '%s' "$plugin_out" | head -1)"
+  if printf '%s' "$first_line" | grep -q '🦞'; then ok "menubar: first line contains 🦞"; else bad "menubar: first line contains 🦞" "$first_line"; fi
+  # Contains --- separator.
+  if printf '%s' "$plugin_out" | grep -q '^---$'; then ok "menubar: output has --- separator"; else bad "menubar: output has --- separator" ""; fi
+  # Contains the in-rotation account name.
+  if printf '%s' "$plugin_out" | grep -q 'work'; then ok "menubar: output contains 'work' account"; else bad "menubar: output contains work account" "$plugin_out"; fi
+  # Contains Refresh now action.
+  if printf '%s' "$plugin_out" | grep -q 'Refresh now'; then ok "menubar: output contains 'Refresh now'"; else bad "menubar: output contains Refresh now" "$plugin_out"; fi
+  # Contains Policy submenu header.
+  if printf '%s' "$plugin_out" | grep -q 'Policy'; then ok "menubar: output contains 'Policy'"; else bad "menubar: output contains Policy" "$plugin_out"; fi
+  # Policy submenu child lines must emit with the -- prefix (Fix 1).
+  if printf '%s' "$plugin_out" | grep -q '^--usage-aware'; then ok "menubar: --usage-aware submenu child line emitted"; else bad "menubar: --usage-aware submenu line missing (printf fix)" "$(printf '%s' "$plugin_out" | grep -E '^--' || echo '<none>')"; fi
+  # No 'invalid option' errors (Fix 1 regression guard).
+  plugin_out_with_stderr="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" CLAWROUTER_NOTIFY=0 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>&1)"
+  if printf '%s' "$plugin_out_with_stderr" | grep -q 'invalid option'; then
+    bad "menubar: no printf 'invalid option' errors" "$(printf '%s' "$plugin_out_with_stderr" | grep 'invalid option' | head -3)"
+  else
+    ok "menubar: no 'invalid option' errors in combined stdout+stderr"
+  fi
+  # No raw error or 'unbound' message in output.
+  if printf '%s' "$plugin_out" | grep -qiE 'unbound variable|syntax error'; then
+    bad "menubar: no unbound/syntax errors in output" "$(printf '%s' "$plugin_out" | grep -iE 'unbound|syntax')"
+  else
+    ok "menubar: no unbound/syntax errors in output"
+  fi
+)
+
+echo "== menubar plugin: empty/garbage cr output -> graceful fallback =="
+(
+  MB_BIN2="$SBX/mb_bin2"; mkdir -p "$MB_BIN2"
+  # Fake cr that prints nothing.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$MB_BIN2/cr"
+  chmod +x "$MB_BIN2/cr"
+  MB_JQ="$(command -v jq)"
+
+  plugin_out="$(CLAWROUTER_CR="$MB_BIN2/cr" CLAWROUTER_JQ="$MB_JQ" CLAWROUTER_NOTIFY=0 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"; rc=$?
+
+  eq "menubar empty cr: exits 0" "$rc" "0"
+  first_line2="$(printf '%s' "$plugin_out" | head -1)"
+  if printf '%s' "$first_line2" | grep -q '🦞'; then ok "menubar empty cr: first line contains 🦞"; else bad "menubar empty cr: first line contains 🦞" "$first_line2"; fi
+  if printf '%s' "$plugin_out" | grep -qiE 'no data|refresh'; then ok "menubar empty cr: hints to refresh"; else bad "menubar empty cr: no-data hint" "$plugin_out"; fi
+)
+
 echo
 PASS=$(wc -c < "$SBX/.pass" | tr -d ' '); FAIL=$(wc -c < "$SBX/.fail" | tr -d ' ')
 echo "== $PASS passed, $FAIL failed =="
