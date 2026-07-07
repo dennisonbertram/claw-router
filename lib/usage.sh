@@ -18,7 +18,10 @@ cr_read_credentials() {
   return 1
 }
 
-# Refresh an access token given a refresh token. Echoes new access token.
+# Exchange a refresh token for a fresh token set. Echoes the raw OAuth token
+# response JSON ({access_token, refresh_token?, expires_in?, ...}) on stdout so
+# the caller can persist the rotated refresh token too. Nonzero on failure or
+# when the response carries no access token.
 cr_refresh_token() {
   local refresh="$1" resp
   cr_have curl || return 2
@@ -26,7 +29,41 @@ cr_refresh_token() {
     -H 'Content-Type: application/json' \
     -d "$(jq -n --arg rt "$refresh" --arg cid "$CR_OAUTH_CLIENT_ID" \
           '{grant_type:"refresh_token", refresh_token:$rt, client_id:$cid}')" 2>/dev/null)" || return 1
-  printf '%s' "$resp" | jq -r '.access_token // empty'
+  printf '%s' "$resp" | jq -e '.access_token' >/dev/null 2>&1 || return 1
+  printf '%s' "$resp"
+}
+
+# Persist an updated credentials JSON blob for a config dir, mirroring exactly
+# where cr_read_credentials reads from: macOS Keychain, else <dir>/.credentials.json.
+# Best-effort: returns nonzero if it could not be written anywhere.
+cr_write_credentials() {
+  local dir="$1" blob="$2" svc file
+  [[ -z "$blob" || "$blob" == "null" ]] && return 1
+  if cr_have security; then
+    svc="$(cr_keychain_service "$dir")"
+    security add-generic-password -U -s "$svc" -a "${USER:-$(id -un)}" -w "$blob" 2>/dev/null && return 0
+  fi
+  if [[ -n "$dir" ]]; then file="${dir}/.credentials.json"; else file="${HOME}/.claude/.credentials.json"; fi
+  [[ -e "$file" || -d "$(dirname "$file")" ]] || return 1
+  ( umask 177; printf '%s' "$blob" > "$file" ) 2>/dev/null || return 1
+  return 0
+}
+
+# Merge a fresh OAuth token response into the stored credentials blob and write
+# it back. Anthropic ROTATES refresh tokens, so persisting both the new access
+# token and any rotated refresh token is mandatory — otherwise the next poll
+# re-uses the now-invalid stored tokens and auto-refresh breaks permanently
+# (leaving usage frozen at the last snapshot). Best-effort; nonzero on failure.
+cr_persist_refreshed_creds() {
+  local dir="$1" creds="$2" resp="$3" merged now_ms
+  now_ms="$(( $(date +%s) * 1000 ))"
+  merged="$(jq -n --argjson creds "$creds" --argjson resp "$resp" --argjson now "$now_ms" '
+    $creds
+    | .claudeAiOauth.accessToken = $resp.access_token
+    | (if ($resp.refresh_token // null) != null then .claudeAiOauth.refreshToken = $resp.refresh_token else . end)
+    | (if ($resp.expires_in   // null) != null then .claudeAiOauth.expiresAt   = ($now + ($resp.expires_in * 1000)) else . end)
+  ' 2>/dev/null)" || return 1
+  cr_write_credentials "$dir" "$merged"
 }
 
 # Fetch raw usage JSON for an account dir. Handles one 401 -> refresh -> retry.
@@ -49,8 +86,13 @@ cr_fetch_usage_raw() {
   local out; out="$(_cr_usage_call "$access")" || return 1
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
   if [[ "$code" == "401" && -n "$refresh" ]]; then
-    local newtok; newtok="$(cr_refresh_token "$refresh")" || return 1
+    local rtresp newtok
+    rtresp="$(cr_refresh_token "$refresh")" || return 1
+    newtok="$(printf '%s' "$rtresp" | jq -r '.access_token // empty')"
     [[ -z "$newtok" ]] && return 1
+    # Persist refreshed + rotated tokens so the NEXT poll doesn't re-use the
+    # expired/consumed ones. Best-effort — a write failure must not fail the poll.
+    cr_persist_refreshed_creds "$dir" "$creds" "$rtresp" || true
     out="$(_cr_usage_call "$newtok")" || return 1
     code="${out##*$'\n'}"; body="${out%$'\n'*}"
   fi

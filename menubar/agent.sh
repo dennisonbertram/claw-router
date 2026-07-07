@@ -25,8 +25,11 @@ LABEL="com.clawrouter.refresh"
 AGENTS_DIR="${CLAWROUTER_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL="${CLAWROUTER_LAUNCHCTL:-launchctl}"
+JQ_BIN="${CLAWROUTER_JQ:-jq}"
 # Fix 6: use || echo 0 fallback to match plugin consistency.
 DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
+# Bound on how long `kick-wait` waits for a fresh snapshot (0.5s per try).
+KICK_WAIT_TRIES="${CLAWROUTER_KICK_WAIT_TRIES:-30}"
 
 # Data home — MUST match lib/common.sh's resolution so the agent logs into (and
 # the polled `cr` reads) the SAME directory. Hardcoding ~/.claw-router here
@@ -72,6 +75,7 @@ _usage() {
   printf '  uninstall           Unload and remove the LaunchAgent plist\n' >&2
   printf '  status              Print agent state, interval, and recent log lines\n' >&2
   printf '  kick                Trigger an immediate poll (requires agent loaded)\n' >&2
+  printf '  kick-wait           Like kick, but wait for the fresh snapshot to land\n' >&2
   exit 0
 }
 
@@ -234,12 +238,51 @@ _cmd_kick() {
   printf 'Kicked background refresh agent.\n' >&2
 }
 
+# Largest usage.checkedAt (ms epoch) across all cached accounts, or empty when it
+# can't be measured (no jq, or no registry yet). Used to detect poll completion.
+_max_checked_at() {
+  local cfg="$CR_DATA_HOME/config.json"
+  [[ -f "$cfg" ]] || { printf ''; return 0; }
+  command -v "$JQ_BIN" >/dev/null 2>&1 || { printf ''; return 0; }
+  "$JQ_BIN" -r '[.accounts[]?.usage.checkedAt // 0] | max // 0' "$cfg" 2>/dev/null || printf ''
+}
+
+# Like `kick`, but BLOCK until the forced poll writes a newer snapshot (bounded).
+# The menu bar's "Refresh now" calls this so the post-action re-render shows the
+# fresh reading — a bare `kickstart` returns instantly, so the menu would redraw
+# the pre-kick (stale) cache and read as "Refresh did nothing". Falls back to a
+# short fixed wait when progress can't be measured (no jq / no registry yet).
+_cmd_kick_wait() {
+  if ! "$LAUNCHCTL" print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    printf 'error: agent is not loaded — run: cr menubar install\n' >&2
+    exit 1
+  fi
+  local before after i
+  before="$(_max_checked_at)"
+  "$LAUNCHCTL" kickstart -k "$DOMAIN/$LABEL" 2>/dev/null || true
+  if [[ -z "$before" ]]; then
+    sleep 4   # no measurable progress signal — give the poll a moment, then return
+    printf 'Kicked background refresh agent.\n' >&2
+    return 0
+  fi
+  for ((i=0; i<KICK_WAIT_TRIES; i++)); do
+    sleep 0.5
+    after="$(_max_checked_at)"; after="${after:-0}"
+    if [[ "$after" -gt "$before" ]]; then
+      printf 'Refreshed.\n' >&2
+      return 0
+    fi
+  done
+  printf 'Kicked background refresh agent (still polling…).\n' >&2
+}
+
 # --- Dispatch ----------------------------------------------------------------
 case "${1:-}" in
   install)   shift; _cmd_install "${1:-300}" ;;
   uninstall) _cmd_uninstall ;;
   status)    _cmd_status ;;
   kick)      _cmd_kick ;;
+  kick-wait) _cmd_kick_wait ;;
   -h|--help|"") _usage ;;
   *) printf 'error: unknown subcommand: %s\n' "$1" >&2; _usage ;;
 esac

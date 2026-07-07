@@ -1096,6 +1096,57 @@ JSON
   fi
 )
 
+echo "== status --json: past-reset window reads as stale, not exhausted (regression) =="
+(
+  export CR_HOME="$SBX/json_stale_home"; mkdir -p "$CR_HOME/logs"
+  NOW_MS="$(( $(date +%s) * 1000 ))"
+  OLD_MS="$(( NOW_MS - 20 * 86400 * 1000 ))"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "usage-aware",
+  "exhaustedAtPct": 100,
+  "usageTtlSeconds": 900,
+  "accounts": [
+    {
+      "name": "frozen", "kind": "subscription",
+      "configDir": "$SBX/json_stale_home/accounts/frozen",
+      "email": "frozen@x", "plan": "max",
+      "lastUsed": 0, "enabled": true, "usagePct": 100,
+      "usage": {"checkedAt": ${OLD_MS}, "windows": [
+        {"label": "5h session", "used": 100, "resets": "2020-01-01T00:00:00.000000+00:00"},
+        {"label": "7d total",   "used": 28,  "resets": "2020-01-02T00:00:00.000000+00:00"}
+      ]}
+    },
+    {
+      "name": "live", "kind": "subscription",
+      "configDir": "$SBX/json_stale_home/accounts/live",
+      "email": "live@x", "plan": "max",
+      "lastUsed": 0, "enabled": true, "usagePct": 100,
+      "usage": {"checkedAt": ${NOW_MS}, "windows": [
+        {"label": "5h session", "used": 100, "resets": "2035-01-01T00:00:00.000000+00:00"},
+        {"label": "7d total",   "used": 96,  "resets": "2035-01-02T00:00:00.000000+00:00"}
+      ]}
+    }
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+
+  out="$("$CR" status --json 2>/dev/null)"
+  # frozen: both windows reset in the PAST → they have rolled over, so the cached
+  # 100% is stale, not current. Must NOT be exhausted, and must be flagged stale.
+  eq "status --json stale: frozen.exhausted==false (past-reset windows)" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="frozen")|.exhausted')" "false"
+  eq "status --json stale: frozen.stale==true" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="frozen")|.stale')" "true"
+  # live: window still open at 100% → correctly exhausted, and fresh.
+  eq "status --json stale: live.exhausted==true (future-reset window)" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="live")|.exhausted')" "true"
+  eq "status --json stale: live.stale==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="live")|.stale')" "false"
+)
+
 echo "== status --json: no cache -> still valid JSON, exit 0 =="
 (
   export CR_HOME="$SBX/json_nocache_home"; mkdir -p "$CR_HOME/logs"
@@ -1435,6 +1486,56 @@ echo "== menubar agent: status + uninstall =="
   if grep -qE 'bootout|unload' "$FAKE_LC_LOG" 2>/dev/null; then ok "agent uninstall: launchctl bootout/unload called"; else bad "agent uninstall: launchctl not called" "$(cat "$FAKE_LC_LOG")"; fi
 )
 
+echo "== menubar agent: kick-wait blocks until the snapshot advances =="
+(
+  KW_HOME="$SBX/agent_kickwait_home"; mkdir -p "$KW_HOME/logs"
+  KW_CONFIG="$KW_HOME/config.json"; export KW_CONFIG
+  cat > "$KW_CONFIG" <<'JSON'
+{
+  "selection": "round-robin",
+  "accounts": [
+    {"name":"a","kind":"subscription","configDir":null,"enabled":true,
+     "usagePct":50,"usage":{"checkedAt":1000,"windows":[]}}
+  ]
+}
+JSON
+
+  # Fake launchctl: print OK; kickstart simulates a successful poll by advancing
+  # checkedAt in the registry (what `cr status --refresh` does for real).
+  KW_LC_DIR="$SBX/kw_lc_bin"; mkdir -p "$KW_LC_DIR"
+  cat > "$KW_LC_DIR/launchctl" <<'EOKW'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "print" ]]; then exit 0; fi
+if [[ "${1:-}" == "kickstart" && -n "${KW_CONFIG:-}" && -f "$KW_CONFIG" ]]; then
+  tmp="$(mktemp)"
+  jq '.accounts[0].usage.checkedAt = 9999999999999' "$KW_CONFIG" > "$tmp" && mv "$tmp" "$KW_CONFIG"
+fi
+exit 0
+EOKW
+  chmod +x "$KW_LC_DIR/launchctl"
+
+  out="$(CR_HOME="$KW_HOME" CLAWROUTER_LAUNCHCTL="$KW_LC_DIR/launchctl" \
+    CLAWROUTER_KICK_WAIT_TRIES=20 \
+    bash "$CR_REPO/menubar/agent.sh" kick-wait 2>&1)"; rc=$?
+  eq "kick-wait: exits 0 on success" "$rc" "0"
+  if printf '%s' "$out" | grep -qi 'refreshed'; then ok "kick-wait: confirms 'Refreshed' once snapshot advances"; else bad "kick-wait: no 'Refreshed' confirmation" "$out"; fi
+)
+
+echo "== menubar agent: kick-wait fails when agent not loaded =="
+(
+  NL_LC_DIR="$SBX/kw_noload_bin"; mkdir -p "$NL_LC_DIR"
+  cat > "$NL_LC_DIR/launchctl" <<'EONL'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "print" ]]; then exit 1; fi
+exit 0
+EONL
+  chmod +x "$NL_LC_DIR/launchctl"
+  err="$(CLAWROUTER_LAUNCHCTL="$NL_LC_DIR/launchctl" \
+    bash "$CR_REPO/menubar/agent.sh" kick-wait 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "kick-wait not loaded: exits nonzero"; else bad "kick-wait not loaded: should fail" "rc=$rc"; fi
+  if printf '%s' "$err" | grep -qi 'not loaded'; then ok "kick-wait not loaded: helpful message"; else bad "kick-wait not loaded: message missing" "$err"; fi
+)
+
 echo "== menubar agent: install rejects bad interval / missing cr =="
 (
   T="$SBX/agent_bad_test"
@@ -1655,17 +1756,18 @@ FAKECR3
     bad "plugin agent-loaded: 'Refresh now' missing" \
       "$(printf '%s' "$plugin_out_agent" | grep -i refresh || echo '<none>')"
   fi
-  if printf '%s' "$plugin_out_agent" | grep -q 'kickstart'; then
-    ok "plugin agent-loaded: Refresh now uses kickstart"
+  # Refresh now must invoke the BLOCKING kick-wait (so the post-action re-render
+  # shows the fresh snapshot), not a fire-and-forget kickstart.
+  refresh_line="$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '')"
+  if printf '%s' "$refresh_line" | grep -q 'param1=kick-wait'; then
+    ok "plugin agent-loaded: Refresh now uses blocking kick-wait"
   else
-    bad "plugin agent-loaded: kickstart not in Refresh now line" \
-      "$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '<none>')"
+    bad "plugin agent-loaded: kick-wait not in Refresh now line" "${refresh_line:-<none>}"
   fi
-  if printf '%s' "$plugin_out_agent" | grep -q 'com.clawrouter.refresh'; then
-    ok "plugin agent-loaded: Refresh now references label"
+  if printf '%s' "$refresh_line" | grep -qE 'agent\.sh.*refresh=true'; then
+    ok "plugin agent-loaded: Refresh now runs agent.sh and re-renders"
   else
-    bad "plugin agent-loaded: label missing from Refresh now" \
-      "$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '<none>')"
+    bad "plugin agent-loaded: Refresh now not wired to agent.sh + refresh=true" "${refresh_line:-<none>}"
   fi
   if printf '%s' "$plugin_out_agent" | grep -q 'param2=--refresh'; then
     bad "plugin agent-loaded: must not contain param2=--refresh" \

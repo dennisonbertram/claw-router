@@ -937,7 +937,17 @@ cr_emit_status_json() {
           $kind == "subscription" or ($kind == "api" and $rotate)
         )) as $inRotation |
         ($acct.usagePct) as $usagePct |
-        (($usagePct != null) and ($usagePct >= $exhaustedAtPct)) as $exhausted |
+        ($acct.usage.windows // []) as $wins |
+        # A cached window whose reset time is already in the past has provably
+        # rolled over — its cached utilization is stale, not current. Only count
+        # windows that are still live (reset unknown, or reset in the future).
+        ([ $wins[]
+           | select(((.resets // null) == null) or ((.resets|tostring)[0:19] > ($generatedAt[0:19])))
+           | (.used // 0) ]) as $liveUsed |
+        (if ($wins | length) == 0
+         then (($usagePct != null) and ($usagePct >= $exhaustedAtPct))
+         else (($liveUsed | length) > 0) and (($liveUsed | max) >= $exhaustedAtPct)
+         end) as $exhausted |
         (($acct.usage.checkedAt // null) | if . then (. / 1000 | todate) else null end) as $checkedAt |
         ($checkedAt == null or (($nowS - ($acct.usage.checkedAt // 0) / 1000) > $ttlSeconds)) as $stale |
         {

@@ -178,6 +178,7 @@ for ((i=0; i<acct_count; i++)); do
   aemail="$(printf '%s' "$acct" | "$JQ_BIN" -r '.email // ""')" || aemail=""
   ain="$(printf '%s' "$acct" | "$JQ_BIN" -r '.inRotation')" || ain="false"
   aexhausted="$(printf '%s' "$acct" | "$JQ_BIN" -r '.exhausted')" || aexhausted="false"
+  astale="$(printf '%s' "$acct" | "$JQ_BIN" -r '.stale')" || astale="false"
   awindows="$(printf '%s' "$acct" | "$JQ_BIN" -c '.windows')" || awindows="[]"
   awin_count="$(printf '%s' "$awindows" | "$JQ_BIN" 'length')" || awin_count=0
 
@@ -191,10 +192,14 @@ for ((i=0; i<acct_count; i++)); do
   name_label="◆ ${aname}"
   [[ -n "$aemail" ]] && name_label="${name_label}  ${aemail}"
   [[ "$aexhausted" == "true" ]] && name_label="${name_label}  · exhausted"
+  # Stale but not exhausted: the numbers below are frozen (couldn't refresh —
+  # often an expired login), not a live reading. Say so instead of implying live.
+  [[ "$aexhausted" != "true" && "$astale" == "true" && "$awin_count" -gt 0 ]] && name_label="${name_label}  · stale"
   [[ "$ain" == "false" ]] && name_label="${name_label}  · explicit-only"
 
   name_params="font=Menlo"
   [[ "$aexhausted" == "true" ]] && name_params="${name_params} color=#c0392b"
+  [[ "$aexhausted" != "true" && "$astale" == "true" && "$awin_count" -gt 0 ]] && name_params="${name_params} color=#c8821a"
   [[ "$ain" == "false" ]] && name_params="${name_params} color=#888888"
 
   printf '%s | %s\n' "$name_label" "$name_params"
@@ -242,8 +247,12 @@ echo '---'
 # "Refresh now" delegates to the background agent (no Keychain prompts in the plugin).
 # If the agent is not loaded, offer to install it instead.
 if [[ "$agent_loaded" -eq 1 ]]; then
-  printf 'Refresh now | shell=%s | param1=kickstart | param2=-k | param3=%s/%s | terminal=false | refresh=true\n' \
-    "$LAUNCHCTL" "$AGENT_DOMAIN" "$LABEL"
+  # kick-wait BLOCKS until the forced poll writes a fresh snapshot, so the
+  # refresh=true re-render below shows real data. A bare `kickstart` returns
+  # instantly and the menu would redraw the pre-kick (stale) cache — which reads
+  # as "Refresh did nothing". SwiftBar/xbar shows a running indicator meanwhile.
+  printf 'Refresh now | shell=%s | param1=kick-wait | terminal=false | refresh=true\n' \
+    "$AGENT_SH"
 else
   printf '%s\n' "Enable background refresh… | shell=${AGENT_SH} | param1=install | terminal=true | refresh=true"
 fi
