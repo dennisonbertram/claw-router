@@ -41,10 +41,14 @@ limit mid-flow, this is for you: stop manually `/login`-swapping, and let `cr`
 balance them — including a `usage-aware` mode that routes to whichever account
 has the most headroom right now.
 
-> **Your secrets never move.** `cr` flips one environment variable
-> (`CLAUDE_CONFIG_DIR`) per launch; Claude Code reads the right macOS Keychain
-> login and refreshes its own token. `cr` never reads, copies, or stores your
-> credentials.
+> **Your secrets never move between accounts.** `cr` flips one environment
+> variable (`CLAUDE_CONFIG_DIR`) per launch; Claude Code reads the right macOS
+> Keychain login and refreshes its own token. The one place `cr` touches a
+> credential is usage polling: it reads an account's OAuth token in place to ask
+> Anthropic how much headroom is left, and when Anthropic rotates the token
+> during that check, saves the rotated token back to the same Keychain item
+> (`.credentials.json` on Linux) so the login keeps working. Tokens are only
+> ever sent to Anthropic, and never copied between accounts.
 
 ## How it works
 
@@ -62,7 +66,8 @@ account, and on each launch it:
    through with zero overhead.
 
 Claude Code itself reads the right Keychain credential and refreshes the token;
-`cr` never copies or stores your secrets.
+a launch never reads, copies, or stores your secrets — only usage polling
+touches a token (see the note above).
 
 Your existing `~/.claude` login is registered as the `default` account and is
 never modified.
@@ -322,13 +327,21 @@ Keychain access for each account the first time the agent runs — click
 **Always Allow** and it never asks again. When an in-rotation account crosses the
 exhaustion threshold the plugin fires a single macOS notification.
 
+The dropdown is honest about data quality. Numbers that couldn't be refreshed
+(an expired login, say) are labeled `· stale` in amber instead of being passed
+off as live. A window whose reset time has already passed is shown as *rolled
+over — awaiting refresh* rather than as a red 0%-left bar, and it doesn't drag
+the headline percentage down while it waits for the next poll. "Refresh now"
+blocks until the fresh snapshot actually lands (bounded at ~15 s), so the menu
+redraws with the new reading instead of the cache it just invalidated.
+
 See [`menubar/README.md`](menubar/README.md) for agent management (`cr menubar
 status`, `cr menubar refresh`, `cr menubar uninstall`), configuration
 (`CLAWROUTER_CR`, `CLAWROUTER_NOTIFY`), and troubleshooting.
 
 `cr status --json` is also useful on its own — a machine-readable usage snapshot
-(policy, next pick, per-account/per-window headroom, exhaustion, staleness) you can
-pipe into your own tools:
+(policy, next pick, per-account/per-window headroom, exhaustion, staleness,
+window rollover) you can pipe into your own tools:
 
 ```sh
 cr status --json            # cached snapshot, instant, no network
@@ -389,9 +402,10 @@ bash test/run.sh
 ```
 
 No real Claude or network calls — uses a fake `claude` and an isolated config
-home. 30+ assertions cover account selection, env scrubbing, arg forwarding,
-the Keychain naming scheme, backend isolation, usage rendering, and
-cross-account session linking.
+home. 270+ assertions cover account selection, env scrubbing, arg forwarding,
+the Keychain naming scheme, backend isolation, usage rendering, token-refresh
+persistence, the menu-bar plugin and its background agent, and cross-account
+session linking.
 
 ## License
 

@@ -98,7 +98,7 @@ The agent log is at `~/.claw-router/logs/refresh-agent.log`.
 ## How the menu bar works
 
 - **The plugin never polls.** It reads `cr status --json` (cache-only, no network, no Keychain) on every SwiftBar tick.
-- **"Refresh now"** nudges the already-authorized agent to poll immediately — no new Keychain prompts.
+- **"Refresh now"** nudges the already-authorized agent to poll immediately — no new Keychain prompts — and waits (up to ~15 s) for the fresh snapshot to land before the menu redraws, so you see the new reading rather than the pre-kick cache.
 - **When the agent is not installed**, the "Refresh now" item becomes "Enable background refresh…" which opens a terminal to run `cr menubar install` so you can click "Always Allow" interactively.
 - **Stale-data hint:** if any subscription's cache is stale and the agent is not running, a `⚠ Usage is stale` line appears at the top of the dropdown.
 
