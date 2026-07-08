@@ -141,6 +141,29 @@ print(f"{d}d{h:02d}h" if d else (f"{h}h{m:02d}m" if h else f"{m}m"))
 PY
 }
 
+# --- Helper: compact "ago" delta for a PAST ISO-8601 timestamp --------------
+# Empty output when the timestamp is in the future, unparseable, or python3 is
+# missing — callers degrade to text without a time.
+fmt_ago() {
+  local iso="$1"
+  [[ -z "$iso" || "$iso" == "null" ]] && return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$iso" <<'PY' 2>/dev/null || true
+import sys, datetime
+iso = sys.argv[1].replace("Z", "+00:00")
+try:
+    t = datetime.datetime.fromisoformat(iso)
+except Exception:
+    sys.exit(0)
+now = datetime.datetime.now(datetime.timezone.utc)
+s = int((now - t).total_seconds())
+if s < 0:
+    sys.exit(0)
+d, r = divmod(s, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+print(f"{d}d{h:02d}h" if d else (f"{h}h{m:02d}m" if h else f"{m}m"))
+PY
+}
+
 # --- Header: policy + next pick -------------------------------------------
 policy="$(printf '%s' "$data" | "$JQ_BIN" -r '.policy')" || policy="round-robin"
 pinned="$(printf '%s' "$data" | "$JQ_BIN" -r '.pinned // ""')" || pinned=""
@@ -234,9 +257,15 @@ for ((i=0; i<acct_count; i++)); do
       esac
 
       # The cached numbers predate the window reset; drawing them as a live red
-      # 0% bar would contradict exhausted=false. Say so instead and move on.
+      # 0% bar would contradict exhausted=false. Say so — with WHEN it rolled
+      # over, so the line isn't vague — and move on.
       if [[ "$wrolled" == "true" ]]; then
-        printf '  %s rolled over — awaiting refresh | font=Menlo size=12 color=#888888\n' "$short_label"
+        rolled_ago="$(fmt_ago "$wresets")"
+        if [[ -n "$rolled_ago" ]]; then
+          printf '  %s rolled over %s ago — awaiting refresh | font=Menlo size=12 color=#888888\n' "$short_label" "$rolled_ago"
+        else
+          printf '  %s rolled over — awaiting refresh | font=Menlo size=12 color=#888888\n' "$short_label"
+        fi
         continue
       fi
 
@@ -255,6 +284,12 @@ done
 
 # --- Actions section -------------------------------------------------------
 echo '---'
+# ACTION-LINE FORMAT: SwiftBar parses ONE "|" and then space-separated key=value
+# params. Extra " | " separators between params corrupt the keys ("param1"
+# parses as "| param1"), which silently drops BOTH terminal=false and the args —
+# the click then opens a Terminal window running the bare command. So: exactly
+# one pipe per action line, and quote path values (quotes are parsed + stripped)
+# so spaced install dirs survive.
 # "Refresh now" delegates to the background agent (no Keychain prompts in the plugin).
 # If the agent is not loaded, offer to install it instead.
 if [[ "$agent_loaded" -eq 1 ]]; then
@@ -262,25 +297,27 @@ if [[ "$agent_loaded" -eq 1 ]]; then
   # refresh=true re-render below shows real data. A bare `kickstart` returns
   # instantly and the menu would redraw the pre-kick (stale) cache — which reads
   # as "Refresh did nothing". SwiftBar/xbar shows a running indicator meanwhile.
-  # SwiftBar splits params on whitespace, so the path value must be quoted to
-  # survive spaced install dirs.
-  printf 'Refresh now | shell="%s" | param1=kick-wait | terminal=false | refresh=true\n' \
+  printf 'Refresh now | shell="%s" param1=kick-wait terminal=false refresh=true\n' \
     "$AGENT_SH"
 else
-  printf '%s\n' "Enable background refresh… | shell=\"${AGENT_SH}\" | param1=install | terminal=true | refresh=true"
+  printf 'Enable background refresh… | shell="%s" param1=install terminal=true refresh=true\n' "$AGENT_SH"
 fi
+# Action clicks exec under SwiftBar's own minimal GUI PATH — this plugin's
+# PATH fix-up above doesn't apply to them — so a bare "cr" won't resolve there.
+# Hand actions the absolute path instead.
+CR_ACTION_BIN="$(command -v "$CR_BIN" 2>/dev/null || printf '%s' "$CR_BIN")"
 printf '%s\n' 'Policy'
 for p in round-robin lru random usage-aware; do
-  printf '%s\n' "--${p} | shell=${CR_BIN} | param1=policy | param2=${p} | terminal=false | refresh=true"
+  printf -- '--%s | shell="%s" param1=policy param2=%s terminal=false refresh=true\n' "$p" "$CR_ACTION_BIN" "$p"
 done
 printf '%s\n' 'Pin account'
 # Only subscription and rotating-api accounts can be pinned.
 pin_names="$(printf '%s' "$data" | "$JQ_BIN" -r '.accounts[] | select(.kind == "subscription" or (.kind == "api" and .rotate == true)) | .name')" || pin_names=""
 while IFS= read -r pname; do
   [[ -z "$pname" ]] && continue
-  printf '%s\n' "--${pname} | shell=${CR_BIN} | param1=use | param2=${pname} | terminal=false | refresh=true"
+  printf -- '--%s | shell="%s" param1=use param2="%s" terminal=false refresh=true\n' "$pname" "$CR_ACTION_BIN" "$pname"
 done <<< "$pin_names"
-printf '%s\n' "--Clear pin | shell=${CR_BIN} | param1=use | param2=--clear | terminal=false | refresh=true"
+printf -- '--Clear pin | shell="%s" param1=use param2=--clear terminal=false refresh=true\n' "$CR_ACTION_BIN"
 printf 'Open Claw Router ↗ | href=https://dennisonbertram.github.io/claw-router/\n'
 
 # --- Notifications (throttled, opt-out) ------------------------------------

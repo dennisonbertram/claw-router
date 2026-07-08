@@ -1560,6 +1560,15 @@ MBLC
   else
     bad "menubar rollover: output has a 'rolled over' explanatory line" "$plugin_out"
   fi
+  # The line must say WHEN it rolled over, not just that it did (resetsAt is
+  # 2020 → formats as many days ago). Needs python3, same as fmt_reset.
+  if command -v python3 >/dev/null 2>&1; then
+    if printf '%s' "$rolled_line" | grep -qE 'rolled over [0-9]+[dhm][^|]* ago'; then
+      ok "menubar rollover: line says how long ago the window rolled over"
+    else
+      bad "menubar rollover: missing 'ago' time on rolled-over line" "$rolled_line"
+    fi
+  fi
   if printf '%s' "$rolled_line" | grep -q 'color=#888888'; then
     ok "menubar rollover: rolled-over line is dim (color=#888888)"
   else
@@ -1955,6 +1964,12 @@ FAKECR3
   else
     bad "plugin no-agent: shell path not quoted" "${enable_line:-<none>}"
   fi
+  # Same single-pipe rule as the agent-loaded actions (see that test).
+  if [[ -n "$enable_line" && -z "$(printf '%s' "$enable_line" | awk -F'|' 'NF>2')" ]]; then
+    ok "plugin no-agent: Enable line is single-pipe"
+  else
+    bad "plugin no-agent: Enable line multi-pipe or missing" "${enable_line:-<none>}"
+  fi
 
   # Render with agent loaded (FAKE_LAUNCHCTL_PRINT_OK=1).
   plugin_out_agent="$(CLAWROUTER_CR="$MB_BIN3/cr" CLAWROUTER_JQ="$MB_JQ" \
@@ -1987,6 +2002,21 @@ FAKECR3
     ok "plugin agent-loaded: shell path is quoted (space-safe)"
   else
     bad "plugin agent-loaded: shell path not quoted" "${refresh_line:-<none>}"
+  fi
+  # SwiftBar parses ONE "|" then space-separated key=value params. A second
+  # pipe corrupts the keys ("param1" → "| param1"), silently dropping BOTH the
+  # args and terminal=false — the click then opens a Terminal window running
+  # the bare command. Regression: every shell= action line has exactly one pipe.
+  multi_pipe="$(printf '%s' "$plugin_out_agent" | grep 'shell=' | awk -F'|' 'NF>2' || true)"
+  if [[ -z "$multi_pipe" ]]; then
+    ok "plugin agent-loaded: action lines are single-pipe (SwiftBar param parsing)"
+  else
+    bad "plugin agent-loaded: multi-pipe action lines corrupt SwiftBar params" "$multi_pipe"
+  fi
+  if printf '%s' "$refresh_line" | grep -q 'terminal=false'; then
+    ok "plugin agent-loaded: Refresh now carries terminal=false"
+  else
+    bad "plugin agent-loaded: Refresh now missing terminal=false" "${refresh_line:-<none>}"
   fi
   if printf '%s' "$plugin_out_agent" | grep -q 'param2=--refresh'; then
     bad "plugin agent-loaded: must not contain param2=--refresh" \
