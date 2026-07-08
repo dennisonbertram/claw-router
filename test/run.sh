@@ -151,6 +151,86 @@ echo "== usage pct parsing (unit) =="
   eq "usage pct handles numeric buckets" "$(cr_usage_pct "$j2")" "17"
 )
 
+echo "== usage: persist refreshed creds rotates tokens (unit, fake keychain) =="
+( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
+  # Fake `security` shadowing /usr/bin/security: add-generic-password writes
+  # its -w blob (the last arg) to FAKE_KC_STORE; find-generic-password reads
+  # it back. Round-tripping through the same fake proves the writer and the
+  # reader agree on service name / location.
+  FAKE_KC_DIR="$SBX/fake_kc_bin"; mkdir -p "$FAKE_KC_DIR"
+  FAKE_KC_STORE="$SBX/fake_kc_store"; export FAKE_KC_STORE
+  cat > "$FAKE_KC_DIR/security" <<'EOSEC'
+#!/usr/bin/env bash
+case "$1" in
+  add-generic-password)
+    for last; do :; done
+    printf '%s' "$last" > "$FAKE_KC_STORE"
+    ;;
+  find-generic-password)
+    [[ -f "$FAKE_KC_STORE" ]] && cat "$FAKE_KC_STORE" || exit 1
+    ;;
+  *) exit 1 ;;
+esac
+EOSEC
+  chmod +x "$FAKE_KC_DIR/security"
+  PATH="$FAKE_KC_DIR:$PATH"
+
+  creds='{"claudeAiOauth":{"accessToken":"A0","refreshToken":"R1","expiresAt":1}}'
+  resp='{"access_token":"A2","refresh_token":"R2","expires_in":3600}'
+  cr_persist_refreshed_creds "/tmp/some-dir" "$creds" "$resp"; rc=$?
+  eq "persist refreshed creds: returns 0" "$rc" "0"
+
+  stored="$(cr_read_credentials "/tmp/some-dir")"
+  eq "persist refreshed creds: accessToken updated"  "$(printf '%s' "$stored" | jq -r '.claudeAiOauth.accessToken')"  "A2"
+  eq "persist refreshed creds: refreshToken rotated"  "$(printf '%s' "$stored" | jq -r '.claudeAiOauth.refreshToken')" "R2"
+  exp_ms="$(printf '%s' "$stored" | jq -r '.claudeAiOauth.expiresAt')"
+  now_ms="$(( $(date +%s) * 1000 ))"
+  if [[ "$exp_ms" -gt "$now_ms" ]]; then ok "persist refreshed creds: expiresAt set in the future"; else bad "persist refreshed creds: expiresAt set in the future" "exp_ms=$exp_ms now_ms=$now_ms"; fi
+
+  # A refresh response with no refresh_token (Anthropic doesn't always rotate)
+  # must preserve the previously-stored (rotated) refresh token.
+  resp2='{"access_token":"A3","expires_in":3600}'
+  cr_persist_refreshed_creds "/tmp/some-dir" "$stored" "$resp2"
+  stored2="$(cr_read_credentials "/tmp/some-dir")"
+  eq "persist refreshed creds: refreshToken preserved when not rotated" "$(printf '%s' "$stored2" | jq -r '.claudeAiOauth.refreshToken')" "R2"
+  eq "persist refreshed creds: accessToken updated again"               "$(printf '%s' "$stored2" | jq -r '.claudeAiOauth.accessToken')"  "A3"
+)
+
+echo "== usage: failed keychain write is NOT masked by a dead file (unit) =="
+( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
+  FAIL_KC_DIR="$SBX/fail_kc_bin"; mkdir -p "$FAIL_KC_DIR"
+  cat > "$FAIL_KC_DIR/security" <<'EOSEC'
+#!/usr/bin/env bash
+exit 1
+EOSEC
+  chmod +x "$FAIL_KC_DIR/security"
+  PATH="$FAIL_KC_DIR:$PATH"
+
+  dir="$SBX/persist_fail_dir"; mkdir -p "$dir"
+  cr_write_credentials "$dir" '{"claudeAiOauth":{"accessToken":"A"}}'; rc=$?
+  if [[ "$rc" -ne 0 ]]; then ok "failed keychain write: cr_write_credentials returns nonzero"; else bad "failed keychain write: cr_write_credentials returns nonzero" "rc=$rc"; fi
+  if [[ ! -e "$dir/.credentials.json" ]]; then ok "failed keychain write: no plaintext fallback file written"; else bad "failed keychain write: no plaintext fallback file written" "file exists on macOS path"; fi
+
+  creds='{"claudeAiOauth":{"accessToken":"A0","refreshToken":"R1","expiresAt":1}}'
+  resp='{"access_token":"A2","refresh_token":"R2","expires_in":3600}'
+  cr_persist_refreshed_creds "$dir" "$creds" "$resp"; rc2=$?
+  if [[ "$rc2" -ne 0 ]]; then ok "failed keychain write: cr_persist_refreshed_creds propagates failure"; else bad "failed keychain write: cr_persist_refreshed_creds propagates failure" "rc=$rc2"; fi
+)
+
+echo "== usage: file-branch write when security is absent (unit) =="
+( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
+  # Linux/Windows path: no `security` on PATH at all, so cr_write_credentials
+  # must fall through to the plaintext file. Narrow PATH to a dir containing
+  # only a `dirname` symlink for the call itself (printf/umask/[[ are builtins).
+  LNX_BIN="$SBX/lnx_bin"; mkdir -p "$LNX_BIN"
+  ln -s "$(command -v dirname)" "$LNX_BIN/dirname"
+  dir="$SBX/lnx_creds"; mkdir -p "$dir"
+  PATH="$LNX_BIN" cr_write_credentials "$dir" '{"claudeAiOauth":{"accessToken":"A9"}}'; rc=$?
+  eq "file branch (no security): returns 0" "$rc" "0"
+  if [[ -f "$dir/.credentials.json" ]]; then ok "file branch: .credentials.json written"; else bad "file branch: .credentials.json written" "missing"; fi
+  eq "file branch: accessToken persisted" "$(jq -r '.claudeAiOauth.accessToken' "$dir/.credentials.json" 2>/dev/null)" "A9"
+)
+
 echo "== backend: excluded from rotation =="
 rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
 cat > "$CR_HOME/config.json" <<JSON
@@ -1147,6 +1227,47 @@ JSON
      "$(printf '%s' "$out" | jq -r '.accounts[]|select(.name=="live")|.stale')" "false"
 )
 
+echo "== status --json: fresh cache + rolled-over window -> flagged rolledOver =="
+(
+  export CR_HOME="$SBX/json_rollover_home"; mkdir -p "$CR_HOME/logs"
+  NOW_MS="$(( $(date +%s) * 1000 ))"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "usage-aware",
+  "exhaustedAtPct": 100,
+  "usageTtlSeconds": 900,
+  "accounts": [
+    {
+      "name": "edge", "kind": "subscription",
+      "configDir": "$SBX/json_rollover_home/accounts/edge",
+      "email": "edge@x", "plan": "max",
+      "lastUsed": 0, "enabled": true, "usagePct": 100,
+      "usage": {"checkedAt": ${NOW_MS}, "windows": [
+        {"label": "5h session", "used": 100, "resets": "2020-01-01T00:00:00.000000+00:00"},
+        {"label": "7d total",   "used": 30,  "resets": "2035-01-01T00:00:00.000000+00:00"}
+      ]}
+    }
+  ],
+  "rotation": {"cursor": 0},
+  "share": {}
+}
+JSON
+
+  out="$("$CR" status --json 2>/dev/null)"
+  # Fresh cache (well within TTL) but a rolled-over window: exhausted must be
+  # false (rollover excluded, same as the stale-cache case above) AND stale must
+  # stay false — rollover is independent of TTL-freshness. This is the gap the
+  # stale-cache test above doesn't cover.
+  eq "status --json rollover: edge.exhausted==false" \
+     "$(printf '%s' "$out" | jq -r '.accounts[0].exhausted')" "false"
+  eq "status --json rollover: edge.stale==false (fresh cache)" \
+     "$(printf '%s' "$out" | jq -r '.accounts[0].stale')" "false"
+  eq "status --json rollover: windows[0].rolledOver==true (past reset)" \
+     "$(printf '%s' "$out" | jq -r '.accounts[0].windows[0].rolledOver')" "true"
+  eq "status --json rollover: windows[1].rolledOver==false (future reset)" \
+     "$(printf '%s' "$out" | jq -r '.accounts[0].windows[1].rolledOver')" "false"
+)
+
 echo "== status --json: no cache -> still valid JSON, exit 0 =="
 (
   export CR_HOME="$SBX/json_nocache_home"; mkdir -p "$CR_HOME/logs"
@@ -1365,6 +1486,89 @@ MBLC
     bad "menubar: no unbound/syntax errors in output" "$(printf '%s' "$plugin_out" | grep -iE 'unbound|syntax')"
   else
     ok "menubar: no unbound/syntax errors in output"
+  fi
+)
+
+echo "== menubar plugin: rolled-over window excluded from title min, shown as explanatory line =="
+(
+  MB_BIN="$SBX/mb_bin_rollover"; mkdir -p "$MB_BIN"
+
+  # Fake cr: one in-rotation account with a rolled-over 5h window (leftPct=0)
+  # and a live 7d window (leftPct=42). Title must bind on the live window.
+  cat > "$MB_BIN/cr" <<FAKECR
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "status" && "\${2:-}" == "--json" ]]; then
+  cat <<'ENDJSON'
+{
+  "schema": 1,
+  "generatedAt": "2026-01-01T00:00:00Z",
+  "policy": "round-robin",
+  "pinned": null,
+  "exhaustedAtPct": 100,
+  "ttlSeconds": 900,
+  "next": {"name": null, "note": "next in rotation -- run a plain 'cr' to advance"},
+  "accounts": [
+    {
+      "name": "work", "kind": "subscription",
+      "email": "work@example.com",
+      "enabled": true, "rotate": true, "inRotation": true,
+      "usagePct": 100, "exhausted": false, "stale": false,
+      "checkedAt": "2026-01-01T00:00:00Z",
+      "windows": [
+        {"label": "5h session", "usedPct": 100, "leftPct": 0, "resetsAt": "2020-01-01T00:00:00Z", "rolledOver": true},
+        {"label": "7d total",   "usedPct": 58, "leftPct": 42, "resetsAt": "2035-01-01T00:00:00Z", "rolledOver": false}
+      ]
+    }
+  ]
+}
+ENDJSON
+  exit 0
+fi
+exit 0
+FAKECR
+  chmod +x "$MB_BIN/cr"
+
+  MB_JQ="$(command -v jq)"
+
+  MB_LC_DIR="$SBX/mb_lc_bin_rollover"; mkdir -p "$MB_LC_DIR"
+  cat > "$MB_LC_DIR/launchctl" <<'MBLC'
+#!/usr/bin/env bash
+exit 0
+MBLC
+  chmod +x "$MB_LC_DIR/launchctl"
+  MB_LC="$MB_LC_DIR/launchctl"
+
+  plugin_out="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" \
+    CLAWROUTER_LAUNCHCTL="$MB_LC" CLAWROUTER_NOTIFY=0 \
+    bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
+
+  first_line="$(printf '%s' "$plugin_out" | head -1)"
+  if printf '%s' "$first_line" | grep -q '42%'; then
+    ok "menubar rollover: title binds on live window (42%)"
+  else
+    bad "menubar rollover: title binds on live window (42%)" "$first_line"
+  fi
+  if printf '%s' "$first_line" | grep -q '🦞 0%'; then
+    bad "menubar rollover: title must NOT be forced to 0% by rolled-over window" "$first_line"
+  else
+    ok "menubar rollover: title not forced to 0% by rolled-over window"
+  fi
+
+  rolled_line="$(printf '%s' "$plugin_out" | grep 'rolled over' || true)"
+  if [[ -n "$rolled_line" ]]; then
+    ok "menubar rollover: output has a 'rolled over' explanatory line"
+  else
+    bad "menubar rollover: output has a 'rolled over' explanatory line" "$plugin_out"
+  fi
+  if printf '%s' "$rolled_line" | grep -q 'color=#888888'; then
+    ok "menubar rollover: rolled-over line is dim (color=#888888)"
+  else
+    bad "menubar rollover: rolled-over line is dim (color=#888888)" "$rolled_line"
+  fi
+  if printf '%s' "$rolled_line" | grep -q 'color=#c0392b'; then
+    bad "menubar rollover: rolled-over line must NOT render as a live red bar" "$rolled_line"
+  else
+    ok "menubar rollover: rolled-over line not rendered as a live red bar"
   fi
 )
 
@@ -1743,6 +1947,14 @@ FAKECR3
     bad "plugin no-agent: expected stale/enable hint" \
       "$(printf '%s' "$plugin_out_noagent" | head -20)"
   fi
+  # SwiftBar splits shell= on whitespace, so the agent.sh path must be quoted
+  # to survive spaced install dirs.
+  enable_line="$(printf '%s' "$plugin_out_noagent" | grep -i 'enable background refresh' || echo '')"
+  if printf '%s' "$enable_line" | grep -qE 'shell="[^"]*agent\.sh"'; then
+    ok "plugin no-agent: shell path is quoted (space-safe)"
+  else
+    bad "plugin no-agent: shell path not quoted" "${enable_line:-<none>}"
+  fi
 
   # Render with agent loaded (FAKE_LAUNCHCTL_PRINT_OK=1).
   plugin_out_agent="$(CLAWROUTER_CR="$MB_BIN3/cr" CLAWROUTER_JQ="$MB_JQ" \
@@ -1768,6 +1980,13 @@ FAKECR3
     ok "plugin agent-loaded: Refresh now runs agent.sh and re-renders"
   else
     bad "plugin agent-loaded: Refresh now not wired to agent.sh + refresh=true" "${refresh_line:-<none>}"
+  fi
+  # SwiftBar splits shell= on whitespace, so the agent.sh path must be quoted
+  # to survive spaced install dirs.
+  if printf '%s' "$refresh_line" | grep -qE 'shell="[^"]*agent\.sh"'; then
+    ok "plugin agent-loaded: shell path is quoted (space-safe)"
+  else
+    bad "plugin agent-loaded: shell path not quoted" "${refresh_line:-<none>}"
   fi
   if printf '%s' "$plugin_out_agent" | grep -q 'param2=--refresh'; then
     bad "plugin agent-loaded: must not contain param2=--refresh" \

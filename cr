@@ -914,6 +914,8 @@ cr_emit_status_json() {
     --arg nextNote     "$next_note" \
     --argjson nowS     "$now_s" \
     '
+    # Complement of the live-window test above: a non-null reset at/before now has rolled over.
+    def rolled_over: ((.resets // null) != null) and ((.resets|tostring)[0:19] <= ($generatedAt[0:19]));
     {
       schema: ($schema | tonumber),
       generatedAt: $generatedAt,
@@ -941,9 +943,7 @@ cr_emit_status_json() {
         # A cached window whose reset time is already in the past has provably
         # rolled over — its cached utilization is stale, not current. Only count
         # windows that are still live (reset unknown, or reset in the future).
-        ([ $wins[]
-           | select(((.resets // null) == null) or ((.resets|tostring)[0:19] > ($generatedAt[0:19])))
-           | (.used // 0) ]) as $liveUsed |
+        ([ $wins[] | select(rolled_over | not) | (.used // 0) ]) as $liveUsed |
         (if ($wins | length) == 0
          then (($usagePct != null) and ($usagePct >= $exhaustedAtPct))
          else (($liveUsed | length) > 0) and (($liveUsed | max) >= $exhaustedAtPct)
@@ -969,7 +969,8 @@ cr_emit_status_json() {
               label: .label,
               usedPct: $usedInt,
               leftPct: $leftInt,
-              resetsAt: (.resets // null)
+              resetsAt: (.resets // null),
+              rolledOver: rolled_over
             }
           ]
         }

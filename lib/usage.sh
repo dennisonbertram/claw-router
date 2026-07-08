@@ -34,14 +34,19 @@ cr_refresh_token() {
 }
 
 # Persist an updated credentials JSON blob for a config dir, mirroring exactly
-# where cr_read_credentials reads from: macOS Keychain, else <dir>/.credentials.json.
-# Best-effort: returns nonzero if it could not be written anywhere.
+# where cr_read_credentials reads from: macOS Keychain when `security` exists,
+# else <dir>/.credentials.json (the non-macOS store — Linux/Windows). On macOS
+# a failed Keychain write returns nonzero rather than falling back to the file:
+# cr_read_credentials never consults the file while `security` exists, so a
+# file write there would be dead data silently masking loss of a rotated
+# refresh token.
 cr_write_credentials() {
   local dir="$1" blob="$2" svc file
   [[ -z "$blob" || "$blob" == "null" ]] && return 1
   if cr_have security; then
     svc="$(cr_keychain_service "$dir")"
-    security add-generic-password -U -s "$svc" -a "${USER:-$(id -un)}" -w "$blob" 2>/dev/null && return 0
+    security add-generic-password -U -s "$svc" -a "${USER:-$(id -un)}" -w "$blob" 2>/dev/null
+    return $?
   fi
   if [[ -n "$dir" ]]; then file="${dir}/.credentials.json"; else file="${HOME}/.claude/.credentials.json"; fi
   [[ -e "$file" || -d "$(dirname "$file")" ]] || return 1
@@ -91,8 +96,11 @@ cr_fetch_usage_raw() {
     newtok="$(printf '%s' "$rtresp" | jq -r '.access_token // empty')"
     [[ -z "$newtok" ]] && return 1
     # Persist refreshed + rotated tokens so the NEXT poll doesn't re-use the
-    # expired/consumed ones. Best-effort — a write failure must not fail the poll.
-    cr_persist_refreshed_creds "$dir" "$creds" "$rtresp" || true
+    # expired/consumed ones. Best-effort for THIS poll — a write failure must
+    # not fail the poll — but no longer silent: a lost rotated refresh token
+    # breaks all FUTURE refreshes, so warn loudly on stderr.
+    cr_persist_refreshed_creds "$dir" "$creds" "$rtresp" \
+      || cr_warn "could not persist refreshed credentials for '${dir:-~/.claude}' — the rotated refresh token was not saved; the next poll may fail to auth"
     out="$(_cr_usage_call "$newtok")" || return 1
     code="${out##*$'\n'}"; body="${out%$'\n'*}"
   fi

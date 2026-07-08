@@ -68,8 +68,11 @@ fi
 
 # --- Compute title ---------------------------------------------------------
 # Binding constraint = minimum leftPct across all windows of in-rotation accounts.
+# Rolled-over windows are frozen pre-reset numbers, not current headroom — exclude
+# them so a just-reset window can't force the title to '🦞 0%'. `!= true` (not
+# `== false`) so older cached JSON lacking the field still counts as live.
 min_left="$(printf '%s' "$data" | "$JQ_BIN" -r '
-  [.accounts[] | select(.inRotation == true) | .windows[] | .leftPct]
+  [.accounts[] | select(.inRotation == true) | .windows[] | select(.rolledOver != true) | .leftPct]
   | if length > 0 then min else empty end
 ')" || min_left=""
 
@@ -213,6 +216,7 @@ for ((i=0; i<acct_count; i++)); do
       wlabel="$(printf '%s' "$win" | "$JQ_BIN" -r '.label')" || wlabel="?"
       wleft="$(printf '%s' "$win" | "$JQ_BIN" -r '.leftPct')" || wleft=0
       wresets="$(printf '%s' "$win" | "$JQ_BIN" -r '.resetsAt // ""')" || wresets=""
+      wrolled="$(printf '%s' "$win" | "$JQ_BIN" -r '.rolledOver // false')" || wrolled="false"
 
       wbar="$(make_bar "$wleft")"
       wcolor="$(left_color_param "$wleft")"
@@ -228,6 +232,13 @@ for ((i=0; i<acct_count; i++)); do
         "7d Haiku")   short_label="7dH " ;;
         *)            short_label="$(printf '%-4s' "$(printf '%s' "$wlabel" | awk '{print $1}')")" ;;
       esac
+
+      # The cached numbers predate the window reset; drawing them as a live red
+      # 0% bar would contradict exhausted=false. Say so instead and move on.
+      if [[ "$wrolled" == "true" ]]; then
+        printf '  %s rolled over — awaiting refresh | font=Menlo size=12 color=#888888\n' "$short_label"
+        continue
+      fi
 
       # Reset countdown.
       reset_str=""
@@ -251,10 +262,12 @@ if [[ "$agent_loaded" -eq 1 ]]; then
   # refresh=true re-render below shows real data. A bare `kickstart` returns
   # instantly and the menu would redraw the pre-kick (stale) cache — which reads
   # as "Refresh did nothing". SwiftBar/xbar shows a running indicator meanwhile.
-  printf 'Refresh now | shell=%s | param1=kick-wait | terminal=false | refresh=true\n' \
+  # SwiftBar splits params on whitespace, so the path value must be quoted to
+  # survive spaced install dirs.
+  printf 'Refresh now | shell="%s" | param1=kick-wait | terminal=false | refresh=true\n' \
     "$AGENT_SH"
 else
-  printf '%s\n' "Enable background refresh… | shell=${AGENT_SH} | param1=install | terminal=true | refresh=true"
+  printf '%s\n' "Enable background refresh… | shell=\"${AGENT_SH}\" | param1=install | terminal=true | refresh=true"
 fi
 printf '%s\n' 'Policy'
 for p in round-robin lru random usage-aware; do
