@@ -174,6 +174,26 @@ JSON
   eq "keychain service name for default" "$(cr_keychain_service "")" "Claude Code-credentials"
 )
 
+echo "== config lock: concurrent writers + stale-owner recovery =="
+( export CR_HOME="$SBX/lock_home"; mkdir -p "$CR_HOME/logs"
+  source "$CR_REPO/lib/common.sh"
+  cr_ensure_home
+  cr_config_update '.counter = 0'
+  for _ in {1..40}; do
+    ( cr_config_update '.counter = ((.counter // 0) + 1)' ) &
+  done
+  wait
+  eq "config lock preserves all concurrent updates" \
+     "$(cr_config_read | jq -r '.counter')" "40"
+
+  if command -v shlock >/dev/null 2>&1; then
+    printf '%s\n' '999999999' > "${CR_CONFIG}.lock"
+    cr_config_update '.staleOwnerRecovered = true'
+    eq "config lock reclaims a dead shlock owner" \
+       "$(cr_config_read | jq -r '.staleOwnerRecovered')" "true"
+  fi
+)
+
 echo "== launch: config dir + env scrub + args =="
 seed
 export ANTHROPIC_API_KEY="SHOULD_BE_SCRUBBED"

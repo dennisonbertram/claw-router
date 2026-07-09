@@ -110,25 +110,69 @@ cr_config_write() {
   mv -f "$tmp" "$CR_CONFIG"
 }
 
-# Portable mkdir-based config lock. macOS ships Bash 3.2 without flock, so the
-# lock is an atomic directory with a pid marker. Writers wait for at most ~10
-# seconds rather than silently racing; the path in a timeout message makes a
-# lock left by a killed process straightforward to inspect and remove.
+# Serialize read-modify-write updates. macOS ships `shlock`, whose link-based
+# acquisition is atomic and whose PID check safely reclaims a lock left by a
+# killed writer. Linux commonly provides `flock`; an atomic mkdir lock remains
+# the dependency-free fallback on other systems.
 cr_config_lock_acquire() {
-  local lock="${CR_CONFIG}.lock" tries=0
+  local lock="${CR_CONFIG}.lock" tries=0 pid
+  CR_CONFIG_LOCK_KIND=""
+  CR_CONFIG_LOCK_HELD=""
+  CR_CONFIG_LOCK_PID=""
+
+  if cr_have shlock; then
+    # In Bash 3.2, $$ is unchanged in background subshells. A short child shell
+    # reports the real current process as its PPID, giving every writer a unique
+    # owner PID for stale-lock recovery.
+    pid="$(sh -c 'printf "%s" "$PPID"')" || pid="$$"
+    while ! shlock -f "$lock" -p "$pid" 2>/dev/null; do
+      tries=$(( tries + 1 ))
+      (( tries >= 200 )) && cr_die "timed out waiting for config lock: $lock"
+      sleep 0.05
+    done
+    CR_CONFIG_LOCK_KIND="shlock"
+    CR_CONFIG_LOCK_HELD="$lock"
+    CR_CONFIG_LOCK_PID="$pid"
+    return 0
+  fi
+
+  if cr_have flock; then
+    exec 7>"$lock"
+    flock -w 10 7 || { exec 7>&-; cr_die "timed out waiting for config lock: $lock"; }
+    CR_CONFIG_LOCK_KIND="flock"
+    CR_CONFIG_LOCK_HELD="$lock"
+    return 0
+  fi
+
   while ! mkdir "$lock" 2>/dev/null; do
     tries=$(( tries + 1 ))
     (( tries >= 200 )) && cr_die "timed out waiting for config lock: $lock"
     sleep 0.05
   done
-  printf '%s\n' "$$" > "$lock/pid"
+  CR_CONFIG_LOCK_KIND="mkdir"
   CR_CONFIG_LOCK_HELD="$lock"
 }
 
 cr_config_lock_release() {
-  local lock="${CR_CONFIG_LOCK_HELD:-}"
-  [[ -n "$lock" ]] && rm -rf "$lock" 2>/dev/null || true
+  local lock="${CR_CONFIG_LOCK_HELD:-}" kind="${CR_CONFIG_LOCK_KIND:-}"
+  case "$kind" in
+    shlock)
+      # Remove only the lock we still own.
+      if [[ -n "$lock" && "$(cat "$lock" 2>/dev/null || true)" == "${CR_CONFIG_LOCK_PID:-}" ]]; then
+        rm -f "$lock" 2>/dev/null || true
+      fi
+      ;;
+    flock)
+      flock -u 7 2>/dev/null || true
+      exec 7>&-
+      ;;
+    mkdir)
+      [[ -n "$lock" ]] && rmdir "$lock" 2>/dev/null || true
+      ;;
+  esac
   CR_CONFIG_LOCK_HELD=""
+  CR_CONFIG_LOCK_KIND=""
+  CR_CONFIG_LOCK_PID=""
 }
 
 # Apply a jq program (arg 1) to the config and persist the result atomically.
