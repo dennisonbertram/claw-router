@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent.sh — LaunchAgent manager for Claw Router background usage polling.
+# agent.sh — LaunchAgent manager for provider-scoped Claw Router usage polling.
 #
 # The SwiftBar plugin reads only the cached snapshot and NEVER polls itself,
 # so it never triggers macOS Keychain prompts. This agent is the sole poller:
@@ -26,6 +26,7 @@ AGENTS_DIR="${CLAWROUTER_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 LAUNCHCTL="${CLAWROUTER_LAUNCHCTL:-launchctl}"
 JQ_BIN="${CLAWROUTER_JQ:-jq}"
+PROVIDER="${CLAWROUTER_PROVIDER:-claude}"
 # Fix 6: use || echo 0 fallback to match plugin consistency.
 DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
 # Bound on how long `kick-wait` waits for a fresh snapshot (0.5s per try).
@@ -82,6 +83,11 @@ _usage() {
 _cmd_install() {
   local interval="${1:-300}"
 
+  case "$PROVIDER" in
+    claude|codex) ;;
+    *) printf 'error: CLAWROUTER_PROVIDER must be claude or codex (got: %s)\n' "$PROVIDER" >&2; exit 1 ;;
+  esac
+
   # Validate interval is a positive integer.
   case "$interval" in
     ''|*[!0-9]*)
@@ -112,10 +118,11 @@ _cmd_install() {
   mkdir -p "$(dirname "$LOG_PATH")"
 
   # Pre-escape dynamic values for XML (Fix 1).
-  local cr_bin_escaped home_escaped log_escaped
+  local cr_bin_escaped home_escaped log_escaped provider_escaped
   cr_bin_escaped="$(printf '%s' "$CR_BIN" | _xml_escape)"
   home_escaped="$(printf '%s' "$HOME" | _xml_escape)"
   log_escaped="$(printf '%s' "$LOG_PATH" | _xml_escape)"
+  provider_escaped="$(printf '%s' "$PROVIDER" | _xml_escape)"
 
   # Write the plist using printf (no eval, no shell expansion inside XML values).
   # Fix 3: RunAtLoad omitted — rely solely on post-install kickstart for first run
@@ -131,6 +138,10 @@ _cmd_install() {
   printf '  <key>ProgramArguments</key>\n' >> "$PLIST"
   printf '  <array>\n' >> "$PLIST"
   printf '    <string>%s</string>\n' "$cr_bin_escaped" >> "$PLIST"
+  if [[ "$PROVIDER" != "claude" ]]; then
+    printf '    <string>--provider</string>\n' >> "$PLIST"
+    printf '    <string>%s</string>\n' "$provider_escaped" >> "$PLIST"
+  fi
   printf '    <string>status</string>\n' >> "$PLIST"
   printf '    <string>--refresh</string>\n' >> "$PLIST"
   printf '  </array>\n' >> "$PLIST"
@@ -174,13 +185,17 @@ _cmd_install() {
   "$LAUNCHCTL" kickstart -k "$DOMAIN/$LABEL" 2>/dev/null || true
 
   printf '\nClaw Router background refresh agent installed.\n' >&2
+  printf '  Provider: %s\n' "$PROVIDER" >&2
   printf '  Polls every %ss using: %s\n' "$interval" "$CR_BIN" >&2
   printf '  Log: %s\n' "$LOG_PATH" >&2
   printf '\n' >&2
-  printf '*** IMPORTANT — one-time Keychain setup ***\n' >&2
-  printf 'macOS will ask to allow access to each account'\''s Keychain credential\n' >&2
-  printf 'the first time the agent runs. Click **Always Allow** so it never asks again.\n' >&2
-  printf '(The credentials are owned by Claude Code; the agent needs read access.)\n' >&2
+  if [[ "$PROVIDER" == "claude" ]]; then
+    printf '*** IMPORTANT — one-time Keychain setup ***\n' >&2
+    printf 'macOS may ask to allow access to each Claude account'\''s Keychain credential\n' >&2
+    printf 'the first time the agent runs. Click **Always Allow** so it never asks again.\n' >&2
+  else
+    printf 'Codex usage refresh uses Codex'\''s official interface; Claw Router does not read Codex credentials.\n' >&2
+  fi
   printf '\n' >&2
   printf 'Manage with: cr menubar status | cr menubar refresh | cr menubar uninstall\n' >&2
 }
@@ -213,6 +228,7 @@ _cmd_status() {
   fi
 
   printf 'Claw Router background refresh agent:\n'
+  printf '  provider: %s\n' "$PROVIDER"
   printf '  plist:    %s\n' "$([ "$plist_ok" -eq 1 ] && echo "installed ($PLIST)" || echo "not installed")"
   printf '  loaded:   %s\n' "$([ "$loaded" -eq 1 ] && echo "yes" || echo "no")"
   if [[ -n "$interval" ]]; then
@@ -238,13 +254,15 @@ _cmd_kick() {
   printf 'Kicked background refresh agent.\n' >&2
 }
 
-# Largest usage.checkedAt (ms epoch) across all cached accounts, or empty when it
+# Largest usage.checkedAt (ms epoch) across cached accounts for this provider, or empty when it
 # can't be measured (no jq, or no registry yet). Used to detect poll completion.
 _max_checked_at() {
   local cfg="$CR_DATA_HOME/config.json"
   [[ -f "$cfg" ]] || { printf ''; return 0; }
   command -v "$JQ_BIN" >/dev/null 2>&1 || { printf ''; return 0; }
-  "$JQ_BIN" -r '[.accounts[]?.usage.checkedAt // 0] | max // 0' "$cfg" 2>/dev/null || printf ''
+  "$JQ_BIN" -r --arg p "$PROVIDER" \
+    '[.accounts[]? | select((.provider // "claude") == $p) | .usage.checkedAt // 0] | max // 0' \
+    "$cfg" 2>/dev/null || printf ''
 }
 
 # Like `kick`, but BLOCK until the forced poll writes a newer snapshot (bounded).

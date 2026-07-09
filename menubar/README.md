@@ -1,19 +1,19 @@
 # Claw Router — menu-bar plugin
 
-A [SwiftBar](https://github.com/swiftbar/SwiftBar) / [xbar](https://xbarapp.com) plugin that watches your Claude subscription headroom in the macOS menu bar, reading live data from `cr status --json`.
+A [SwiftBar](https://github.com/swiftbar/SwiftBar) / [xbar](https://xbarapp.com) plugin that watches Claude or OpenAI Codex account headroom in the macOS menu bar. It reads a provider-scoped cached snapshot from `cr status --json` (Claude, the default) or `cr --provider codex status --json`.
 
 ```
 🦞 42% ▾
 ─────────────────────────────────────
-Policy: round-robin  Next: work
-◆ work  you@work.com
+Provider: claude  Policy: round-robin  Next: work
+◆ work  [claude]  you@work.com
   5h   ████████░░ 42% · 1h17m
   7d   ██████████ 88%
-◆ home  you@home.com
+◆ home  [claude]  you@home.com
   5h   ██████████ 98%
   7d   █████░░░░░ 48%
 ─────────────────────────────────────
-◆ deepseek  · explicit-only
+◆ deepseek  [claude]  · explicit-only
   no usage data
 ─────────────────────────────────────
 Refresh now
@@ -28,6 +28,7 @@ Open Claw Router ↗
 - [SwiftBar](https://github.com/swiftbar/SwiftBar) — `brew install swiftbar` — or [xbar](https://xbarapp.com)
 - `jq` — `brew install jq`
 - `cr` on PATH (install: see the [Claw Router README](../README.md))
+- The selected provider CLI: `claude` for Claude dashboards or `codex` for Codex dashboards
 
 ## Install
 
@@ -53,17 +54,21 @@ controls how often the *usage data* is polled — these are independent.
 
 ## Background refresh agent (required for live data)
 
-The plugin itself **never** calls `cr status --refresh` — doing so would trigger
-a macOS Keychain authorization dialog for each account every time the menu
-renders. Instead, a lightweight launchd LaunchAgent polls usage on a schedule
-and writes the result to the cache. The plugin reads only the cache: instant,
-no prompts, no network.
+The plugin itself **never** performs a live refresh. Instead, a lightweight
+launchd LaunchAgent polls the selected provider on a schedule and writes the
+result to the cache. The plugin reads only that cache: instant, no prompts, no
+network. Claude refresh may require one-time Keychain authorization. Codex
+refresh uses Codex's official interface; Claw Router never reads Codex
+credentials.
 
 After installing the plugin, start the agent:
 
 ```sh
 cr menubar install           # installs + loads the agent (polls every 5 min)
 cr menubar install 120       # custom interval: poll every 2 minutes
+
+# Codex dashboard + refresher (set this in SwiftBar Plugin Settings too)
+CLAWROUTER_PROVIDER=codex cr menubar install
 ```
 
 Or call the script directly:
@@ -73,11 +78,11 @@ bash menubar/agent.sh install
 bash menubar/agent.sh install 120
 ```
 
-### One-time Keychain authorization
+### Claude Keychain authorization
 
-The first time the agent runs, macOS will show an authorization dialog for each
-Claude account's Keychain credential. **Click "Always Allow"** — this grants
-the agent permanent read access and the dialog never appears again.
+For a Claude dashboard, the first agent run may show an authorization dialog for
+each Claude account's Keychain credential. **Click "Always Allow"** so scheduled
+refreshes can run without prompts. This step does not apply to Codex dashboards.
 
 Why does this happen? Claude Code stores your OAuth credentials in your macOS
 Keychain, keyed by config directory. The launchd agent is a separate process
@@ -97,10 +102,11 @@ The agent log is at `~/.claw-router/logs/refresh-agent.log`.
 
 ## How the menu bar works
 
-- **The plugin never polls.** It reads `cr status --json` (cache-only, no network, no Keychain) on every SwiftBar tick.
+- **The plugin never polls.** It reads the selected provider's cached status JSON on every SwiftBar tick.
 - **"Refresh now"** nudges the already-authorized agent to poll immediately — no new Keychain prompts — and waits (up to ~15 s) for the fresh snapshot to land before the menu redraws, so you see the new reading rather than the pre-kick cache.
 - **When the agent is not installed**, the "Refresh now" item becomes "Enable background refresh…" which opens a terminal to run `cr menubar install` so you can click "Always Allow" interactively.
-- **Stale-data hint:** if any subscription's cache is stale and the agent is not running, a `⚠ Usage is stale` line appears at the top of the dropdown.
+- **Provider-aware rows:** every account shows `[claude]` or `[codex]`. Older schema-1 rows without `.provider` are treated as Claude.
+- **Stale-data hint:** if an in-rotation account has stale usage windows and the agent is not running, a `⚠ Usage is stale` line appears at the top of the dropdown. Accounts with no usage data do not create a false stale warning.
 
 ## Configuration
 
@@ -110,15 +116,20 @@ Set environment variables via SwiftBar's Plugin Settings (right-click the icon �
 |---|---|---|
 | `CLAWROUTER_CR` | `cr` | Absolute path to the `cr` binary — needed when `cr` is not on SwiftBar's PATH |
 | `CLAWROUTER_JQ` | `jq` | Absolute path to `jq` |
+| `CLAWROUTER_PROVIDER` | `claude` | Provider dashboard and background refresh to use: `claude` or `codex` |
 | `CLAWROUTER_NOTIFY` | `1` | Set to `0` or `false` to disable exhaustion notifications |
+
+The LaunchAgent manages one provider at a time. After changing
+`CLAWROUTER_PROVIDER`, run `cr menubar install` again so its scheduled refresh
+uses the same provider as the plugin.
 
 To find the absolute path of `cr`: `command -v cr`
 
 ## What it shows
 
 - **Menu-bar title**: `🦞 NN%` where NN is the binding constraint — the minimum `leftPct` across all windows of in-rotation accounts. Color: green ≥50%, orange ≥20%, red <20%.
-- **Per-account rows**: in-rotation accounts first, then non-rotating (dimmed, labeled `explicit-only`). Each account shows a 10-cell Unicode bar per usage window with a compact reset countdown (`1h17m`, `3d04h`, etc.).
-- **Policy and next pick**: shown at the top of the dropdown.
+- **Per-account rows**: provider-labeled, in-rotation accounts first, then non-rotating (dimmed, labeled `explicit-only`). Each account with usage data shows a 10-cell Unicode bar per window with a compact reset countdown (`1h17m`, `3d04h`, etc.); no-data and API-key accounts degrade to `no usage data`.
+- **Provider, policy, and next pick**: shown at the top of the dropdown.
 - **Actions**: Refresh now (or Enable background refresh), set policy, pin an account, or open the project site.
 - **Notifications**: a one-shot macOS notification fires when an in-rotation account first crosses the exhaustion threshold. It clears when usage drops back.
 
@@ -126,12 +137,12 @@ To find the absolute path of `cr`: `command -v cr`
 
 **Blank menu or `🦞 ⚠`**: `cr` or `jq` is not on SwiftBar's PATH. Set `CLAWROUTER_CR` to the absolute path via Plugin Settings. Find it with `command -v cr` in a terminal.
 
-**`🦞 —` with "no data" hint**: No cached usage yet. Start the agent (`cr menubar install`) and click "Always Allow" when prompted, or run `cr status --refresh` once in a terminal to prime the cache.
+**`🦞 —` with "no data" hint**: No cached usage yet. Start the agent (`cr menubar install`) or prime the selected provider manually: `cr status --refresh` for Claude, `cr --provider codex status --refresh` for Codex.
 
-**Usage is always stale / numbers don't update**: The background agent is not running or not authorized. Run `cr menubar status` to check, then `cr menubar install` to reinstall. If the Keychain dialog keeps appearing, it means "Allow" was clicked instead of "Always Allow" — uninstall and reinstall the agent, and click "Always Allow" at each prompt.
+**Usage is always stale / numbers don't update**: Confirm the background agent is running and its provider matches `CLAWROUTER_PROVIDER` with `cr menubar status`, then reinstall it if needed. For Claude, repeated Keychain dialogs mean "Always Allow" was not granted.
 
 **Notifications keep firing**: Check that your `exhaustedAtPct` threshold (`cr config exhausted-at`) is set appropriately. Notifications fire once per crossing; they silence when usage drops below the threshold.
 
 ## Security
 
-The plugin only calls `cr status --json` and `jq`. It never reads credential files or touches your Keychain directly. The background agent calls `cr status --refresh`, which reads Keychain credentials — that is why macOS asks for authorization once.
+The plugin only calls provider-scoped `cr status --json` and `jq`. It never reads credential files or touches your Keychain directly. The Claude background refresh uses the existing Claude usage path and may require Keychain authorization; the Codex path delegates to the official Codex interface, and Claw Router never reads Codex credentials.

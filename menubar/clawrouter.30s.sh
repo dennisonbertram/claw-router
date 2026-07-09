@@ -3,10 +3,11 @@
 # <xbar.version>v1.0.0</xbar.version>
 # <xbar.author>Dennison Bertram</xbar.author>
 # <xbar.author.github>dennisonbertram</xbar.author.github>
-# <xbar.desc>Menu-bar watcher for Claude subscription headroom via Claw Router (cr). Shows binding-constraint usage, per-window bars, and policy/pin actions.</xbar.desc>
+# <xbar.desc>Menu-bar watcher for Claude or Codex account headroom via Claw Router (cr). Shows binding-constraint usage, per-window bars, and provider-scoped policy/pin actions.</xbar.desc>
 # <xbar.dependencies>cr,jq</xbar.dependencies>
 # <xbar.var>string(CLAWROUTER_CR=cr): Path/name of the cr binary. Override when cr is not on SwiftBar's PATH.</xbar.var>
 # <xbar.var>string(CLAWROUTER_JQ=jq): Path/name of the jq binary.</xbar.var>
+# <xbar.var>string(CLAWROUTER_PROVIDER=claude): Provider dashboard to show: claude or codex.</xbar.var>
 # <xbar.var>string(CLAWROUTER_NOTIFY=1): Set to 0 or false to silence exhaust notifications.</xbar.var>
 #
 # The .30s. in the filename sets the refresh interval to 30 seconds.
@@ -21,6 +22,7 @@ PATH="/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin:${PATH}"
 
 CR_BIN="${CLAWROUTER_CR:-cr}"
 JQ_BIN="${CLAWROUTER_JQ:-jq}"
+PROVIDER="${CLAWROUTER_PROVIDER:-claude}"
 LAUNCHCTL="${CLAWROUTER_LAUNCHCTL:-launchctl}"
 LABEL="com.clawrouter.refresh"
 AGENT_DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
@@ -56,7 +58,16 @@ if ! command -v "$CR_BIN" >/dev/null 2>&1 || ! command -v "$JQ_BIN" >/dev/null 2
 fi
 
 # --- Fetch cached data (fast, no network, no Keychain) ---------------------
-data="$("$CR_BIN" status --json 2>/dev/null)" || data=""
+case "$PROVIDER" in
+  claude)
+    # Keep the legacy invocation for schema-1 routers and existing installs.
+    data="$("$CR_BIN" status --json 2>/dev/null)" || data="" ;;
+  codex)
+    data="$("$CR_BIN" --provider codex status --json 2>/dev/null)" || data="" ;;
+  *)
+    printf '🦞 ⚠\n---\nUnknown provider: %s (use claude or codex).\n' "$PROVIDER"
+    exit 0 ;;
+esac
 
 # Validate JSON.
 if [[ -z "$data" ]] || ! printf '%s' "$data" | "$JQ_BIN" -e . >/dev/null 2>&1; then
@@ -169,8 +180,9 @@ policy="$(printf '%s' "$data" | "$JQ_BIN" -r '.policy')" || policy="round-robin"
 pinned="$(printf '%s' "$data" | "$JQ_BIN" -r '.pinned // ""')" || pinned=""
 next_name="$(printf '%s' "$data" | "$JQ_BIN" -r '.next.name // ""')" || next_name=""
 next_note="$(printf '%s' "$data" | "$JQ_BIN" -r '.next.note // ""')" || next_note=""
+selected_provider="$(printf '%s' "$data" | "$JQ_BIN" -r --arg p "$PROVIDER" '.provider // $p')" || selected_provider="$PROVIDER"
 
-header_line="Policy: ${policy}"
+header_line="Provider: ${selected_provider}  Policy: ${policy}"
 [[ -n "$pinned" ]] && header_line="${header_line}  · pinned: ${pinned}"
 
 if [[ -n "$next_name" ]]; then
@@ -184,14 +196,14 @@ printf '%s | font=Menlo size=12\n' "$header_line"
 echo '---'
 
 # --- Stale-data hint (shown only when agent is not loaded) -----------------
-stale_inrotation="$(printf '%s' "$data" | "$JQ_BIN" -r '[.accounts[] | select(.kind=="subscription" and .inRotation==true and .stale==true)] | length')" || stale_inrotation=0
+stale_inrotation="$(printf '%s' "$data" | "$JQ_BIN" -r '[.accounts[] | select(.inRotation==true and .stale==true and ((.windows // []) | length) > 0)] | length')" || stale_inrotation=0
 if [[ "${stale_inrotation:-0}" -gt 0 && "$agent_loaded" -eq 0 ]]; then
   printf '%s\n' '⚠ Usage is stale — turn on "Enable background refresh" below | color=#c8821a font=Menlo size=12'
 fi
 
 # --- Per-account rows: in-rotation first, then non-rotating ---------------
 # Read all accounts as JSON lines; sort inRotation=true first.
-acct_json_list="$(printf '%s' "$data" | "$JQ_BIN" -c '[.accounts[] | {name,kind,email,inRotation,usagePct,exhausted,stale,windows,enabled}] | sort_by(.inRotation | not)')" || acct_json_list="[]"
+acct_json_list="$(printf '%s' "$data" | "$JQ_BIN" -c '[.accounts[] | {name,provider:(.provider // "claude"),kind,email,inRotation,usagePct,exhausted,stale,windows,enabled}] | sort_by(.inRotation | not)')" || acct_json_list="[]"
 
 # Track whether we have printed the separator between rotating and non-rotating.
 prev_in_rotation=-1  # -1 = not started
@@ -201,6 +213,7 @@ acct_count="$(printf '%s' "$acct_json_list" | "$JQ_BIN" 'length')" || acct_count
 for ((i=0; i<acct_count; i++)); do
   acct="$(printf '%s' "$acct_json_list" | "$JQ_BIN" -c ".[$i]")" || continue
   aname="$(printf '%s' "$acct" | "$JQ_BIN" -r '.name')" || aname="?"
+  aprovider="$(printf '%s' "$acct" | "$JQ_BIN" -r '.provider // "claude"')" || aprovider="claude"
   aemail="$(printf '%s' "$acct" | "$JQ_BIN" -r '.email // ""')" || aemail=""
   ain="$(printf '%s' "$acct" | "$JQ_BIN" -r '.inRotation')" || ain="false"
   aexhausted="$(printf '%s' "$acct" | "$JQ_BIN" -r '.exhausted')" || aexhausted="false"
@@ -215,7 +228,7 @@ for ((i=0; i<acct_count; i++)); do
   prev_in_rotation="$([ "$ain" == "true" ] && echo 1 || echo 0)"
 
   # Build account name line.
-  name_label="◆ ${aname}"
+  name_label="◆ ${aname}  [${aprovider}]"
   [[ -n "$aemail" ]] && name_label="${name_label}  ${aemail}"
   [[ "$aexhausted" == "true" ]] && name_label="${name_label}  · exhausted"
   # Stale but not exhausted: the numbers below are frozen (couldn't refresh —
@@ -308,16 +321,31 @@ fi
 CR_ACTION_BIN="$(command -v "$CR_BIN" 2>/dev/null || printf '%s' "$CR_BIN")"
 printf '%s\n' 'Policy'
 for p in round-robin lru random usage-aware; do
-  printf -- '--%s | shell="%s" param1=policy param2=%s terminal=false refresh=true\n' "$p" "$CR_ACTION_BIN" "$p"
+  if [[ "$selected_provider" == "claude" ]]; then
+    printf -- '--%s | shell="%s" param1=policy param2=%s terminal=false refresh=true\n' "$p" "$CR_ACTION_BIN" "$p"
+  else
+    printf -- '--%s | shell="%s" param1=--provider param2="%s" param3=policy param4=%s terminal=false refresh=true\n' \
+      "$p" "$CR_ACTION_BIN" "$selected_provider" "$p"
+  fi
 done
 printf '%s\n' 'Pin account'
-# Only subscription and rotating-api accounts can be pinned.
-pin_names="$(printf '%s' "$data" | "$JQ_BIN" -r '.accounts[] | select(.kind == "subscription" or (.kind == "api" and .rotate == true)) | .name')" || pin_names=""
+# The status contract owns provider-specific eligibility through inRotation.
+pin_names="$(printf '%s' "$data" | "$JQ_BIN" -r '.accounts[] | select(.inRotation == true) | .name')" || pin_names=""
 while IFS= read -r pname; do
   [[ -z "$pname" ]] && continue
-  printf -- '--%s | shell="%s" param1=use param2="%s" terminal=false refresh=true\n' "$pname" "$CR_ACTION_BIN" "$pname"
+  if [[ "$selected_provider" == "claude" ]]; then
+    printf -- '--%s | shell="%s" param1=use param2="%s" terminal=false refresh=true\n' "$pname" "$CR_ACTION_BIN" "$pname"
+  else
+    printf -- '--%s | shell="%s" param1=--provider param2="%s" param3=use param4="%s" terminal=false refresh=true\n' \
+      "$pname" "$CR_ACTION_BIN" "$selected_provider" "$pname"
+  fi
 done <<< "$pin_names"
-printf -- '--Clear pin | shell="%s" param1=use param2=--clear terminal=false refresh=true\n' "$CR_ACTION_BIN"
+if [[ "$selected_provider" == "claude" ]]; then
+  printf -- '--Clear pin | shell="%s" param1=use param2=--clear terminal=false refresh=true\n' "$CR_ACTION_BIN"
+else
+  printf -- '--Clear pin | shell="%s" param1=--provider param2="%s" param3=use param4=--clear terminal=false refresh=true\n' \
+    "$CR_ACTION_BIN" "$selected_provider"
+fi
 printf 'Open Claw Router ↗ | href=https://dennisonbertram.github.io/claw-router/\n'
 
 # --- Notifications (throttled, opt-out) ------------------------------------

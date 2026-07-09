@@ -34,6 +34,46 @@ chmod +x "$FAKEBIN/claude"
 export PATH="$FAKEBIN:$PATH"
 export FAKE_OUT="$SBX/claude_out"
 
+# Fake codex on PATH: records provider env and exact argv without touching a
+# real Codex login. Management commands and launches all flow through this one
+# stub, so provider tests can prove command shape as well as isolation.
+cat > "$FAKEBIN/codex" <<'EOF'
+#!/usr/bin/env bash
+out="${FAKE_CODEX_OUT:?FAKE_CODEX_OUT must be set}"
+printf 'CALL' >> "${FAKE_CODEX_LOG:?FAKE_CODEX_LOG must be set}"
+for arg in "$@"; do printf '\t<%s>' "$arg" >> "$FAKE_CODEX_LOG"; done
+printf '\n' >> "$FAKE_CODEX_LOG"
+{
+  echo "CODEX_HOME=${CODEX_HOME-<unset>}"
+  echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR-<unset>}"
+  echo "OPENAI_API_KEY=${OPENAI_API_KEY-<unset>}"
+  echo "CODEX_API_KEY=${CODEX_API_KEY-<unset>}"
+  echo "CODEX_ACCESS_TOKEN=${CODEX_ACCESS_TOKEN-<unset>}"
+  echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY-<unset>}"
+  echo "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN-<unset>}"
+  echo "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN-<unset>}"
+  echo "ARGC=$#"
+  i=0
+  for arg in "$@"; do
+    printf 'ARG%d=<%s>\n' "$i" "$arg"
+    i=$((i + 1))
+  done
+} > "$out"
+
+# Keep auth commands hermetic while behaving enough like Codex for cr's
+# management flows. `login status` is successful by default; tests can force a
+# failure with FAKE_CODEX_LOGIN_STATUS_EXIT.
+if [[ "${1:-}" == "login" && "${2:-}" == "status" ]]; then
+  printf '%s\n' "Logged in using ChatGPT"
+  exit "${FAKE_CODEX_LOGIN_STATUS_EXIT:-0}"
+fi
+exit "${FAKE_CODEX_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/codex"
+export FAKE_CODEX_OUT="$SBX/codex_out"
+export FAKE_CODEX_LOG="$SBX/codex_calls.log"
+: > "$FAKE_CODEX_LOG"
+
 CR="$CR_REPO/cr"
 run_cr() { "$CR" "$@" 2>"$SBX/stderr"; }
 
@@ -49,6 +89,32 @@ seed() {
   ],
   "rotation": {"cursor":0},
   "share": {} }
+JSON
+}
+
+# Mixed-provider fixture. Providerless accounts intentionally exercise the
+# legacy-Claude compatibility path; Codex routing state is isolated under the
+# provider namespace while Claude keeps the original top-level fields.
+seed_providers() {
+  rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs" \
+    "$CR_HOME/accounts/claude-a" "$CR_HOME/accounts/claude-b" \
+    "$CR_HOME/accounts/codex-one" "$CR_HOME/accounts/codex-two"
+  cat > "$CR_HOME/config.json" <<JSON
+{
+  "selection": "round-robin",
+  "accounts": [
+    {"name":"claude-a","configDir":"$CR_HOME/accounts/claude-a","lastUsed":0,"enabled":true},
+    {"name":"claude-b","provider":"claude","configDir":"$CR_HOME/accounts/claude-b","lastUsed":0,"enabled":true},
+    {"name":"codex-one","provider":"codex","kind":"subscription","configDir":"$CR_HOME/accounts/codex-one","lastUsed":0,"enabled":true},
+    {"name":"codex-two","provider":"codex","kind":"subscription","configDir":"$CR_HOME/accounts/codex-two","lastUsed":0,"enabled":true},
+    {"name":"codex-default","provider":"codex","kind":"subscription","configDir":null,"lastUsed":0,"enabled":false}
+  ],
+  "rotation": {"cursor":0},
+  "providers": {
+    "codex": {"selection":"round-robin","defaultAccount":null,"rotation":{"cursor":0}}
+  },
+  "share": {}
+}
 JSON
 }
 
@@ -142,6 +208,211 @@ eq "plain cr exits 0 (no unbound-variable crash)" "$rc" "0"
 if grep -q 'unbound variable' "$SBX/stderr"; then bad "plain cr: no unbound-variable error" "$(cat "$SBX/stderr")"; else ok "plain cr: no unbound-variable error"; fi
 if grep -q '^CONFIG_DIR=' "$FAKE_OUT"; then ok "plain cr reaches launch (execs claude)"; else bad "plain cr reaches launch" "fake claude not invoked: $(cat "$FAKE_OUT")"; fi
 eq "plain cr forwards NO args to claude" "$(grep '^ARGS=' "$FAKE_OUT")" "ARGS="
+
+echo "== providers: legacy accounts default to Claude =="
+seed
+: > "$FAKE_CODEX_LOG"
+run_cr --account work -p legacy
+eq "legacy account launches Claude" \
+   "$(grep '^CONFIG_DIR=' "$FAKE_OUT")" "CONFIG_DIR=$CR_HOME/accounts/work"
+eq "legacy account never invokes Codex" "$(wc -l < "$FAKE_CODEX_LOG" | tr -d ' ')" "0"
+legacy_list="$("$CR" list 2>&1)"
+legacy_line="$(grep 'work' <<<"$legacy_list" | head -1)"
+if grep -qi 'claude' <<<"$legacy_line"; then
+  ok "legacy account is reported as provider=claude"
+else
+  bad "legacy account is reported as provider=claude" "$legacy_list"
+fi
+legacy_status="$("$CR" status --json 2>/dev/null)"
+eq "legacy status normalizes missing provider to claude" \
+   "$(jq -r '.accounts[]|select(.name=="work")|.provider' <<<"$legacy_status")" "claude"
+
+echo "== providers: Codex launch isolation + verbatim native args =="
+seed_providers
+export CODEX_HOME="SHOULD_BE_SCRUBBED"
+export CLAUDE_CONFIG_DIR="SHOULD_BE_SCRUBBED"
+export OPENAI_API_KEY="SHOULD_BE_SCRUBBED"
+export CODEX_API_KEY="SHOULD_BE_SCRUBBED"
+export CODEX_ACCESS_TOKEN="SHOULD_BE_SCRUBBED"
+export ANTHROPIC_API_KEY="SHOULD_BE_SCRUBBED"
+export ANTHROPIC_AUTH_TOKEN="SHOULD_BE_SCRUBBED"
+export CLAUDE_CODE_OAUTH_TOKEN="SHOULD_BE_SCRUBBED"
+run_cr --provider codex --account codex-one -- exec "hello world" --json
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "Codex account sets CODEX_HOME" \
+   "$(grep '^CODEX_HOME=' <<<"$codex_out")" "CODEX_HOME=$CR_HOME/accounts/codex-one"
+eq "Codex launch unsets CLAUDE_CONFIG_DIR" \
+   "$(grep '^CLAUDE_CONFIG_DIR=' <<<"$codex_out")" "CLAUDE_CONFIG_DIR=<unset>"
+for env_name in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN \
+                ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+  eq "Codex launch scrubs $env_name" \
+     "$(grep "^${env_name}=" <<<"$codex_out")" "${env_name}=<unset>"
+done
+eq "Codex exec argv count preserved" "$(grep '^ARGC=' <<<"$codex_out")" "ARGC=3"
+eq "Codex exec argv[0] preserved" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<exec>"
+eq "Codex exec spaced arg preserved" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<hello world>"
+eq "Codex exec trailing flag preserved" "$(grep '^ARG2=' <<<"$codex_out")" "ARG2=<--json>"
+
+run_cr --provider codex --account codex-default -- exec hi
+eq "default Codex account leaves CODEX_HOME unset" \
+   "$(grep '^CODEX_HOME=' "$FAKE_CODEX_OUT")" "CODEX_HOME=<unset>"
+unset CODEX_HOME CLAUDE_CONFIG_DIR OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+
+echo "== providers: account inference, @ shorthand, native resume =="
+seed_providers
+SID_CODEX="cccccccc-bbbb-aaaa-9999-111111111111"
+mkdir -p "$CR_HOME/accounts/claude-a/projects/-proj"
+printf '{"provider":"claude"}\n' > "$CR_HOME/accounts/claude-a/projects/-proj/$SID_CODEX.jsonl"
+run_cr --account codex-one -- resume "$SID_CODEX" --last
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "--account infers the stored Codex provider" \
+   "$(grep '^CODEX_HOME=' <<<"$codex_out")" "CODEX_HOME=$CR_HOME/accounts/codex-one"
+eq "Codex native resume subcommand preserved" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<resume>"
+eq "Codex native resume id preserved" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<$SID_CODEX>"
+eq "Codex native resume flag preserved" "$(grep '^ARG2=' <<<"$codex_out")" "ARG2=<--last>"
+if [[ ! -e "$CR_HOME/accounts/codex-one/projects/-proj/$SID_CODEX.jsonl" ]]; then
+  ok "Codex resume does not reuse Claude transcript linking"
+else
+  bad "Codex resume does not reuse Claude transcript linking" "unexpected Codex transcript link"
+fi
+
+run_cr @codex-two -- exec "via at"
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "@NAME shorthand infers Codex" \
+   "$(grep '^CODEX_HOME=' <<<"$codex_out")" "CODEX_HOME=$CR_HOME/accounts/codex-two"
+eq "@NAME drops router separator" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<exec>"
+eq "@NAME preserves spaced arg" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<via at>"
+
+echo "== providers: Codex owns -s/--sandbox and bypasses watch =="
+seed_providers
+run_cr --provider codex --account codex-one -s workspace-write exec hi
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "Codex -s is passed through, not consumed by cco" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<-s>"
+eq "Codex -s value is passed through" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<workspace-write>"
+run_cr --provider codex --account codex-one --sandbox read-only exec hi
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "Codex --sandbox is passed through" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<--sandbox>"
+eq "Codex --sandbox value is passed through" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<read-only>"
+
+run_cr --provider codex --watch --account codex-one -- exec hi
+codex_out="$(cat "$FAKE_CODEX_OUT")"
+eq "Codex watch bypass still launches Codex" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<exec>"
+if grep -qiE 'watch.*(without|unsupported|not supported|bypass)' "$SBX/stderr"; then
+  ok "Codex watch bypass is explained"
+else
+  bad "Codex watch bypass is explained" "$(cat "$SBX/stderr")"
+fi
+
+echo "== providers: rotation, policy, and pin are provider-scoped =="
+seed_providers
+codex_homes=""
+for i in 1 2 3; do
+  run_cr --provider codex exec pick
+  codex_homes+="$(grep '^CODEX_HOME=' "$FAKE_CODEX_OUT" | cut -d= -f2-) "
+done
+eq "Codex round-robin uses only its own pool" "$codex_homes" \
+   "$CR_HOME/accounts/codex-one $CR_HOME/accounts/codex-two $CR_HOME/accounts/codex-one "
+claude_homes=""
+for i in 1 2; do
+  run_cr -p pick
+  claude_homes+="$(grep '^CONFIG_DIR=' "$FAKE_OUT" | cut -d= -f2-) "
+done
+eq "plain cr remains in the Claude pool" "$claude_homes" \
+   "$CR_HOME/accounts/claude-a $CR_HOME/accounts/claude-b "
+eq "Codex cursor advances independently" \
+   "$(jq -r '.providers.codex.rotation.cursor' "$CR_HOME/config.json")" "1"
+eq "Claude cursor advances independently" \
+   "$(jq -r '.rotation.cursor' "$CR_HOME/config.json")" "0"
+
+"$CR" --provider codex policy lru 2>/dev/null
+eq "Codex policy stored in provider state" \
+   "$(jq -r '.providers.codex.selection' "$CR_HOME/config.json")" "lru"
+eq "Codex policy does not mutate legacy Claude policy" \
+   "$(jq -r '.selection' "$CR_HOME/config.json")" "round-robin"
+"$CR" --provider codex use codex-two 2>/dev/null
+eq "Codex pin stored in provider state" \
+   "$(jq -r '.providers.codex.defaultAccount' "$CR_HOME/config.json")" "codex-two"
+eq "Codex pin does not create a Claude pin" \
+   "$(jq -r '.defaultAccount // ""' "$CR_HOME/config.json")" ""
+run_cr --provider codex exec pinned
+eq "Codex provider pin controls only Codex launch" \
+   "$(grep '^CODEX_HOME=' "$FAKE_CODEX_OUT")" "CODEX_HOME=$CR_HOME/accounts/codex-two"
+
+echo "== providers: list and status expose selected provider =="
+seed_providers
+provider_list="$("$CR" list 2>&1)"
+codex_line="$(grep 'codex-one' <<<"$provider_list" | head -1)"
+claude_line="$(grep 'claude-a' <<<"$provider_list" | head -1)"
+if grep -qi 'codex' <<<"$codex_line"; then ok "list labels Codex account provider"; else bad "list labels Codex account provider" "$provider_list"; fi
+if grep -qi 'claude' <<<"$claude_line"; then ok "list labels legacy Claude provider"; else bad "list labels legacy Claude provider" "$provider_list"; fi
+provider_status="$("$CR" --provider codex status --json 2>/dev/null)"
+eq "status identifies the selected provider" "$(jq -r '.provider' <<<"$provider_status")" "codex"
+eq "status filters rows to the selected provider" \
+   "$(jq -r '[.accounts[].provider] | unique | join(",")' <<<"$provider_status")" "codex"
+if jq -e '.accounts[]|select(.name=="codex-one" and .provider=="codex")' <<<"$provider_status" >/dev/null 2>&1; then
+  ok "status rows include provider"
+else
+  bad "status rows include provider" "$provider_status"
+fi
+
+echo "== providers: Codex management uses provider-native commands =="
+rm -rf "$CR_HOME"; mkdir -p "$CR_HOME/logs"
+cat > "$CR_HOME/config.json" <<JSON
+{"selection":"round-robin","accounts":[],"rotation":{"cursor":0},
+ "providers":{"codex":{"selection":"round-robin","defaultAccount":null,"rotation":{"cursor":0}}},"share":{}}
+JSON
+: > "$FAKE_CODEX_LOG"
+"$CR" --provider codex add codex-new >"$SBX/codex_add_stdout" 2>"$SBX/codex_add_stderr"; rc=$?
+eq "Codex add exits 0 with fake auth" "$rc" "0"
+eq "Codex add persists provider" \
+   "$(jq -r '.accounts[]|select(.name=="codex-new")|.provider' "$CR_HOME/config.json")" "codex"
+codex_new_home="$(jq -r '.accounts[]|select(.name=="codex-new")|.configDir' "$CR_HOME/config.json")"
+eq "Codex add allocates an isolated home" "$codex_new_home" "$CR_HOME/accounts/codex-new"
+if grep -q '^cli_auth_credentials_store[[:space:]]*=[[:space:]]*"file"' "$codex_new_home/config.toml" 2>/dev/null; then
+  ok "Codex add configures file credential storage"
+else
+  bad "Codex add configures file credential storage" "$(cat "$codex_new_home/config.toml" 2>/dev/null || echo missing)"
+fi
+if grep -q $'^CALL\t<login>' "$FAKE_CODEX_LOG"; then ok "Codex add invokes 'codex login'"; else bad "Codex add invokes 'codex login'" "$(cat "$FAKE_CODEX_LOG")"; fi
+
+: > "$FAKE_CODEX_LOG"
+"$CR" --provider codex login codex-new >/dev/null 2>&1
+if grep -q $'^CALL\t<login>$' "$FAKE_CODEX_LOG"; then ok "Codex login uses native command"; else bad "Codex login uses native command" "$(cat "$FAKE_CODEX_LOG")"; fi
+: > "$FAKE_CODEX_LOG"
+"$CR" --provider codex logout codex-new >/dev/null 2>&1
+if grep -q $'^CALL\t<logout>$' "$FAKE_CODEX_LOG"; then ok "Codex logout uses native command"; else bad "Codex logout uses native command" "$(cat "$FAKE_CODEX_LOG")"; fi
+: > "$FAKE_CODEX_LOG"
+"$CR" --provider codex doctor codex-new >/dev/null 2>&1
+if grep -q $'^CALL\t<login>\t<status>$' "$FAKE_CODEX_LOG"; then ok "Codex doctor uses 'codex login status'"; else bad "Codex doctor uses 'codex login status'" "$(cat "$FAKE_CODEX_LOG")"; fi
+
+echo "== providers: Codex does not use Claude usage or adopt paths =="
+seed_providers
+NO_CLAUDE_BIN="$SBX/no_claude_provider_bin"; mkdir -p "$NO_CLAUDE_BIN"
+NO_CLAUDE_CALLS="$SBX/no_claude_provider_calls"; export NO_CLAUDE_CALLS
+: > "$NO_CLAUDE_CALLS"
+cat > "$NO_CLAUDE_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$NO_CLAUDE_CALLS"
+exit 97
+EOF
+cat > "$NO_CLAUDE_BIN/security" <<'EOF'
+#!/usr/bin/env bash
+printf 'security %s\n' "$*" >> "$NO_CLAUDE_CALLS"
+exit 97
+EOF
+chmod +x "$NO_CLAUDE_BIN/curl" "$NO_CLAUDE_BIN/security"
+PATH="$NO_CLAUDE_BIN:$PATH" "$CR" --provider codex usage codex-one >"$SBX/codex_usage_out" 2>"$SBX/codex_usage_err"; rc=$?
+if [[ "$rc" -eq 0 ]]; then ok "Codex usage capability degrades gracefully"; else bad "Codex usage capability degrades gracefully" "rc=$rc $(cat "$SBX/codex_usage_err")"; fi
+eq "Codex usage never calls Claude curl/keychain paths" "$(cat "$NO_CLAUDE_CALLS")" ""
+
+"$CR" --provider codex adopt "$SID_CODEX" codex-two >"$SBX/codex_adopt_out" 2>"$SBX/codex_adopt_err"; rc=$?
+if [[ "$rc" -ne 0 ]]; then ok "Codex adopt is capability-gated"; else bad "Codex adopt is capability-gated" "unexpected success"; fi
+if grep -qiE 'codex|unsupported|not supported|session' "$SBX/codex_adopt_err"; then
+  ok "Codex adopt rejection is explained"
+else
+  bad "Codex adopt rejection is explained" "$(cat "$SBX/codex_adopt_err")"
+fi
 
 echo "== usage pct parsing (unit) =="
 ( source "$CR_REPO/lib/common.sh"; source "$CR_REPO/lib/usage.sh"
@@ -1461,28 +1732,28 @@ MBLC
   eq "menubar: exits 0 with good data" "$rc" "0"
   # First line contains the lobster emoji.
   first_line="$(printf '%s' "$plugin_out" | head -1)"
-  if printf '%s' "$first_line" | grep -q '🦞'; then ok "menubar: first line contains 🦞"; else bad "menubar: first line contains 🦞" "$first_line"; fi
+  if grep -q '🦞' <<<"$first_line"; then ok "menubar: first line contains 🦞"; else bad "menubar: first line contains 🦞" "$first_line"; fi
   # Contains --- separator.
-  if printf '%s' "$plugin_out" | grep -q '^---$'; then ok "menubar: output has --- separator"; else bad "menubar: output has --- separator" ""; fi
+  if grep -q '^---$' <<<"$plugin_out"; then ok "menubar: output has --- separator"; else bad "menubar: output has --- separator" ""; fi
   # Contains the in-rotation account name.
-  if printf '%s' "$plugin_out" | grep -q 'work'; then ok "menubar: output contains 'work' account"; else bad "menubar: output contains work account" "$plugin_out"; fi
+  if grep -q 'work' <<<"$plugin_out"; then ok "menubar: output contains 'work' account"; else bad "menubar: output contains work account" "$plugin_out"; fi
   # With agent loaded, "Refresh now" should appear (not "Enable background refresh").
-  if printf '%s' "$plugin_out" | grep -q 'Refresh now'; then ok "menubar: output contains 'Refresh now'"; else bad "menubar: output contains Refresh now" "$plugin_out"; fi
+  if grep -q 'Refresh now' <<<"$plugin_out"; then ok "menubar: output contains 'Refresh now'"; else bad "menubar: output contains Refresh now" "$plugin_out"; fi
   # Contains Policy submenu header.
-  if printf '%s' "$plugin_out" | grep -q 'Policy'; then ok "menubar: output contains 'Policy'"; else bad "menubar: output contains Policy" "$plugin_out"; fi
+  if grep -q 'Policy' <<<"$plugin_out"; then ok "menubar: output contains 'Policy'"; else bad "menubar: output contains Policy" "$plugin_out"; fi
   # Policy submenu child lines must emit with the -- prefix (Fix 1).
-  if printf '%s' "$plugin_out" | grep -q '^--usage-aware'; then ok "menubar: --usage-aware submenu child line emitted"; else bad "menubar: --usage-aware submenu line missing (printf fix)" "$(printf '%s' "$plugin_out" | grep -E '^--' || echo '<none>')"; fi
+  if grep -q '^--usage-aware' <<<"$plugin_out"; then ok "menubar: --usage-aware submenu child line emitted"; else bad "menubar: --usage-aware submenu line missing (printf fix)" "$(printf '%s' "$plugin_out" | grep -E '^--' || echo '<none>')"; fi
   # No 'invalid option' errors (Fix 1 regression guard).
   plugin_out_with_stderr="$(CLAWROUTER_CR="$MB_BIN/cr" CLAWROUTER_JQ="$MB_JQ" \
     CLAWROUTER_LAUNCHCTL="$MB_LC" CLAWROUTER_NOTIFY=0 \
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>&1)"
-  if printf '%s' "$plugin_out_with_stderr" | grep -q 'invalid option'; then
+  if grep -q 'invalid option' <<<"$plugin_out_with_stderr"; then
     bad "menubar: no printf 'invalid option' errors" "$(printf '%s' "$plugin_out_with_stderr" | grep 'invalid option' | head -3)"
   else
     ok "menubar: no 'invalid option' errors in combined stdout+stderr"
   fi
   # No raw error or 'unbound' message in output.
-  if printf '%s' "$plugin_out" | grep -qiE 'unbound variable|syntax error'; then
+  if grep -qiE 'unbound variable|syntax error' <<<"$plugin_out"; then
     bad "menubar: no unbound/syntax errors in output" "$(printf '%s' "$plugin_out" | grep -iE 'unbound|syntax')"
   else
     ok "menubar: no unbound/syntax errors in output"
@@ -1543,12 +1814,12 @@ MBLC
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
 
   first_line="$(printf '%s' "$plugin_out" | head -1)"
-  if printf '%s' "$first_line" | grep -q '42%'; then
+  if grep -q '42%' <<<"$first_line"; then
     ok "menubar rollover: title binds on live window (42%)"
   else
     bad "menubar rollover: title binds on live window (42%)" "$first_line"
   fi
-  if printf '%s' "$first_line" | grep -q '🦞 0%'; then
+  if grep -q '🦞 0%' <<<"$first_line"; then
     bad "menubar rollover: title must NOT be forced to 0% by rolled-over window" "$first_line"
   else
     ok "menubar rollover: title not forced to 0% by rolled-over window"
@@ -1563,18 +1834,18 @@ MBLC
   # The line must say WHEN it rolled over, not just that it did (resetsAt is
   # 2020 → formats as many days ago). Needs python3, same as fmt_reset.
   if command -v python3 >/dev/null 2>&1; then
-    if printf '%s' "$rolled_line" | grep -qE 'rolled over [0-9]+[dhm][^|]* ago'; then
+    if grep -qE 'rolled over [0-9]+[dhm][^|]* ago' <<<"$rolled_line"; then
       ok "menubar rollover: line says how long ago the window rolled over"
     else
       bad "menubar rollover: missing 'ago' time on rolled-over line" "$rolled_line"
     fi
   fi
-  if printf '%s' "$rolled_line" | grep -q 'color=#888888'; then
+  if grep -q 'color=#888888' <<<"$rolled_line"; then
     ok "menubar rollover: rolled-over line is dim (color=#888888)"
   else
     bad "menubar rollover: rolled-over line is dim (color=#888888)" "$rolled_line"
   fi
-  if printf '%s' "$rolled_line" | grep -q 'color=#c0392b'; then
+  if grep -q 'color=#c0392b' <<<"$rolled_line"; then
     bad "menubar rollover: rolled-over line must NOT render as a live red bar" "$rolled_line"
   else
     ok "menubar rollover: rolled-over line not rendered as a live red bar"
@@ -1594,8 +1865,8 @@ echo "== menubar plugin: empty/garbage cr output -> graceful fallback =="
 
   eq "menubar empty cr: exits 0" "$rc" "0"
   first_line2="$(printf '%s' "$plugin_out" | head -1)"
-  if printf '%s' "$first_line2" | grep -q '🦞'; then ok "menubar empty cr: first line contains 🦞"; else bad "menubar empty cr: first line contains 🦞" "$first_line2"; fi
-  if printf '%s' "$plugin_out" | grep -qiE 'no data|refresh'; then ok "menubar empty cr: hints to refresh"; else bad "menubar empty cr: no-data hint" "$plugin_out"; fi
+  if grep -q '🦞' <<<"$first_line2"; then ok "menubar empty cr: first line contains 🦞"; else bad "menubar empty cr: first line contains 🦞" "$first_line2"; fi
+  if grep -qiE 'no data|refresh' <<<"$plugin_out"; then ok "menubar empty cr: hints to refresh"; else bad "menubar empty cr: no-data hint" "$plugin_out"; fi
 )
 
 # =========================================================================
@@ -1687,8 +1958,8 @@ echo "== menubar agent: status + uninstall =="
     FAKE_LAUNCHCTL_PRINT_OK=1 \
     bash "$CR_REPO/menubar/agent.sh" status 2>/dev/null)"; rc=$?
   eq "agent status: exits 0" "$rc" "0"
-  if printf '%s' "$status_out" | grep -qiE 'loaded.*yes|yes'; then ok "agent status: reports loaded=yes"; else bad "agent status: loaded=yes not shown" "$status_out"; fi
-  if printf '%s' "$status_out" | grep -qiE 'installed|plist'; then ok "agent status: mentions plist"; else bad "agent status: plist mention missing" "$status_out"; fi
+  if grep -qiE 'loaded.*yes|yes' <<<"$status_out"; then ok "agent status: reports loaded=yes"; else bad "agent status: loaded=yes not shown" "$status_out"; fi
+  if grep -qiE 'installed|plist' <<<"$status_out"; then ok "agent status: mentions plist"; else bad "agent status: plist mention missing" "$status_out"; fi
 
   # Uninstall.
   : > "$FAKE_LC_LOG"
@@ -1731,7 +2002,7 @@ EOKW
     CLAWROUTER_KICK_WAIT_TRIES=20 \
     bash "$CR_REPO/menubar/agent.sh" kick-wait 2>&1)"; rc=$?
   eq "kick-wait: exits 0 on success" "$rc" "0"
-  if printf '%s' "$out" | grep -qi 'refreshed'; then ok "kick-wait: confirms 'Refreshed' once snapshot advances"; else bad "kick-wait: no 'Refreshed' confirmation" "$out"; fi
+  if grep -qi 'refreshed' <<<"$out"; then ok "kick-wait: confirms 'Refreshed' once snapshot advances"; else bad "kick-wait: no 'Refreshed' confirmation" "$out"; fi
 )
 
 echo "== menubar agent: kick-wait fails when agent not loaded =="
@@ -1746,7 +2017,7 @@ EONL
   err="$(CLAWROUTER_LAUNCHCTL="$NL_LC_DIR/launchctl" \
     bash "$CR_REPO/menubar/agent.sh" kick-wait 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then ok "kick-wait not loaded: exits nonzero"; else bad "kick-wait not loaded: should fail" "rc=$rc"; fi
-  if printf '%s' "$err" | grep -qi 'not loaded'; then ok "kick-wait not loaded: helpful message"; else bad "kick-wait not loaded: message missing" "$err"; fi
+  if grep -qi 'not loaded' <<<"$err"; then ok "kick-wait not loaded: helpful message"; else bad "kick-wait not loaded: message missing" "$err"; fi
 )
 
 echo "== menubar agent: install rejects bad interval / missing cr =="
@@ -1937,20 +2208,20 @@ FAKECR3
     FAKE_LAUNCHCTL_PRINT_OK=0 \
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
 
-  if printf '%s' "$plugin_out_noagent" | grep -q 'Enable background refresh'; then
+  if grep -q 'Enable background refresh' <<<"$plugin_out_noagent"; then
     ok "plugin no-agent: shows 'Enable background refresh' action"
   else
     bad "plugin no-agent: 'Enable background refresh' missing" \
       "$(printf '%s' "$plugin_out_noagent" | grep -i refresh || echo '<none>')"
   fi
-  if printf '%s' "$plugin_out_noagent" | grep -q 'param2=--refresh'; then
+  if grep -q 'param2=--refresh' <<<"$plugin_out_noagent"; then
     bad "plugin no-agent: must not contain param2=--refresh" \
       "$(printf '%s' "$plugin_out_noagent" | grep 'param2=--refresh')"
   else
     ok "plugin no-agent: no param2=--refresh in output"
   fi
   # Stale hint should appear when agent not loaded.
-  if printf '%s' "$plugin_out_noagent" | grep -qi 'stale\|Enable background refresh'; then
+  if grep -qi 'stale\|Enable background refresh' <<<"$plugin_out_noagent"; then
     ok "plugin no-agent: stale or enable-refresh hint present"
   else
     bad "plugin no-agent: expected stale/enable hint" \
@@ -1959,7 +2230,7 @@ FAKECR3
   # SwiftBar splits shell= on whitespace, so the agent.sh path must be quoted
   # to survive spaced install dirs.
   enable_line="$(printf '%s' "$plugin_out_noagent" | grep -i 'enable background refresh' || echo '')"
-  if printf '%s' "$enable_line" | grep -qE 'shell="[^"]*agent\.sh"'; then
+  if grep -qE 'shell="[^"]*agent\.sh"' <<<"$enable_line"; then
     ok "plugin no-agent: shell path is quoted (space-safe)"
   else
     bad "plugin no-agent: shell path not quoted" "${enable_line:-<none>}"
@@ -1977,7 +2248,7 @@ FAKECR3
     FAKE_LAUNCHCTL_PRINT_OK=1 \
     bash "$CR_REPO/menubar/clawrouter.30s.sh" 2>/dev/null)"
 
-  if printf '%s' "$plugin_out_agent" | grep -q 'Refresh now'; then
+  if grep -q 'Refresh now' <<<"$plugin_out_agent"; then
     ok "plugin agent-loaded: shows 'Refresh now' action"
   else
     bad "plugin agent-loaded: 'Refresh now' missing" \
@@ -1986,19 +2257,19 @@ FAKECR3
   # Refresh now must invoke the BLOCKING kick-wait (so the post-action re-render
   # shows the fresh snapshot), not a fire-and-forget kickstart.
   refresh_line="$(printf '%s' "$plugin_out_agent" | grep -i 'refresh now' || echo '')"
-  if printf '%s' "$refresh_line" | grep -q 'param1=kick-wait'; then
+  if grep -q 'param1=kick-wait' <<<"$refresh_line"; then
     ok "plugin agent-loaded: Refresh now uses blocking kick-wait"
   else
     bad "plugin agent-loaded: kick-wait not in Refresh now line" "${refresh_line:-<none>}"
   fi
-  if printf '%s' "$refresh_line" | grep -qE 'agent\.sh.*refresh=true'; then
+  if grep -qE 'agent\.sh.*refresh=true' <<<"$refresh_line"; then
     ok "plugin agent-loaded: Refresh now runs agent.sh and re-renders"
   else
     bad "plugin agent-loaded: Refresh now not wired to agent.sh + refresh=true" "${refresh_line:-<none>}"
   fi
   # SwiftBar splits shell= on whitespace, so the agent.sh path must be quoted
   # to survive spaced install dirs.
-  if printf '%s' "$refresh_line" | grep -qE 'shell="[^"]*agent\.sh"'; then
+  if grep -qE 'shell="[^"]*agent\.sh"' <<<"$refresh_line"; then
     ok "plugin agent-loaded: shell path is quoted (space-safe)"
   else
     bad "plugin agent-loaded: shell path not quoted" "${refresh_line:-<none>}"
@@ -2013,12 +2284,12 @@ FAKECR3
   else
     bad "plugin agent-loaded: multi-pipe action lines corrupt SwiftBar params" "$multi_pipe"
   fi
-  if printf '%s' "$refresh_line" | grep -q 'terminal=false'; then
+  if grep -q 'terminal=false' <<<"$refresh_line"; then
     ok "plugin agent-loaded: Refresh now carries terminal=false"
   else
     bad "plugin agent-loaded: Refresh now missing terminal=false" "${refresh_line:-<none>}"
   fi
-  if printf '%s' "$plugin_out_agent" | grep -q 'param2=--refresh'; then
+  if grep -q 'param2=--refresh' <<<"$plugin_out_agent"; then
     bad "plugin agent-loaded: must not contain param2=--refresh" \
       "$(printf '%s' "$plugin_out_agent" | grep 'param2=--refresh')"
   else

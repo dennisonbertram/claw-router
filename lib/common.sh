@@ -80,6 +80,9 @@ cr_default_config='{
   "selection": "round-robin",
   "accounts": [],
   "rotation": { "cursor": 0 },
+  "providers": {
+    "codex": { "selection": "round-robin", "rotation": { "cursor": 0 } }
+  },
   "share": { "settings.json": true, "CLAUDE.md": true, "commands": true, "rules": true }
 }'
 
@@ -107,14 +110,48 @@ cr_config_write() {
   mv -f "$tmp" "$CR_CONFIG"
 }
 
+# Portable mkdir-based config lock. macOS ships Bash 3.2 without flock, so the
+# lock is an atomic directory with a pid marker. A dead owner's lock is removed;
+# live writers wait for at most ~10 seconds rather than silently racing.
+cr_config_lock_acquire() {
+  local lock="${CR_CONFIG}.lock" tries=0 owner=""
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [[ -f "$lock/pid" ]]; then
+      owner="$(cat "$lock/pid" 2>/dev/null || true)"
+      if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -rf "$lock" 2>/dev/null || true
+        continue
+      fi
+    fi
+    tries=$(( tries + 1 ))
+    (( tries >= 200 )) && cr_die "timed out waiting for config lock: $lock"
+    sleep 0.05
+  done
+  printf '%s\n' "$$" > "$lock/pid"
+  CR_CONFIG_LOCK_HELD="$lock"
+}
+
+cr_config_lock_release() {
+  local lock="${CR_CONFIG_LOCK_HELD:-}"
+  [[ -n "$lock" ]] && rm -rf "$lock" 2>/dev/null || true
+  CR_CONFIG_LOCK_HELD=""
+}
+
 # Apply a jq program (arg 1) to the config and persist the result atomically.
 # Extra args are forwarded to jq (e.g. --arg name foo).
 cr_config_update() {
   local prog="$1"; shift
-  local current updated
+  local current updated rc=0
+  cr_ensure_home
+  cr_config_lock_acquire
   current="$(cr_config_read)"
-  updated="$(printf '%s' "$current" | jq "$@" "$prog")" || cr_die "config update failed"
-  printf '%s' "$updated" | cr_config_write
+  if ! updated="$(printf '%s' "$current" | jq "$@" "$prog")"; then
+    cr_config_lock_release
+    cr_die "config update failed"
+  fi
+  printf '%s' "$updated" | cr_config_write || rc=$?
+  cr_config_lock_release
+  return "$rc"
 }
 
 # --- Account helpers -----------------------------------------------------
@@ -133,6 +170,60 @@ cr_account_exists() {
   cr_config_read | jq -e --arg n "$1" '.accounts | any(.name==$n)' >/dev/null 2>&1
 }
 
+# Account provider. Existing registries predate providers, so a missing value
+# is always Claude. Provider names are intentionally a closed set.
+cr_account_provider() {
+  cr_config_read | jq -r --arg n "$1" '
+    .accounts[] | select(.name==$n) | (.provider // "claude")'
+}
+
+cr_validate_provider() {
+  case "${1:-}" in claude|codex) return 0 ;; *) return 1 ;; esac
+}
+
+# Provider-scoped policy / pin / cursor. Claude keeps using the legacy top-level
+# fields so existing configs, scripts, and status consumers remain compatible.
+cr_provider_selection() {
+  local provider="${1:-claude}"
+  if [[ "$provider" == "claude" ]]; then
+    cr_config_read | jq -r '.selection // "round-robin"'
+  else
+    cr_config_read | jq -r --arg p "$provider" '.providers[$p].selection // "round-robin"'
+  fi
+}
+
+cr_provider_pinned() {
+  local provider="${1:-claude}"
+  if [[ "$provider" == "claude" ]]; then
+    cr_config_read | jq -r '.defaultAccount // empty'
+  else
+    cr_config_read | jq -r --arg p "$provider" '.providers[$p].defaultAccount // empty'
+  fi
+}
+
+cr_provider_cursor() {
+  local provider="${1:-claude}"
+  if [[ "$provider" == "claude" ]]; then
+    cr_config_read | jq -r '.rotation.cursor // 0'
+  else
+    cr_config_read | jq -r --arg p "$provider" '.providers[$p].rotation.cursor // 0'
+  fi
+}
+
+cr_provider_set_cursor() {
+  local provider="$1" cursor="$2"
+  if [[ "$provider" == "claude" ]]; then
+    cr_config_update '.rotation.cursor = ($c|tonumber)' --arg c "$cursor" >/dev/null
+  else
+    cr_config_update '
+      .providers = (.providers // {})
+      | .providers[$p] = (.providers[$p] // {})
+      | .providers[$p].rotation = (.providers[$p].rotation // {})
+      | .providers[$p].rotation.cursor = ($c|tonumber)' \
+      --arg p "$provider" --arg c "$cursor" >/dev/null
+  fi
+}
+
 # Echo an account's kind: "subscription" (default), "backend", or "api".
 cr_account_kind() {
   cr_config_read | jq -r --arg n "$1" '
@@ -142,7 +233,9 @@ cr_account_kind() {
 # List enabled *subscription-only* account names — used for usage polling.
 # api accounts have no OAuth usage endpoint; backends are explicit-only.
 cr_subscription_accounts() {
-  cr_config_read | jq -r '.accounts[]
+  local provider="${1:-${CR_PROVIDER:-claude}}"
+  cr_config_read | jq -r --arg p "$provider" '.accounts[]
+    | select((.provider // "claude") == $p)
     | select(.enabled != false)
     | select((.kind // "subscription") == "subscription")
     | .name'
@@ -152,7 +245,9 @@ cr_subscription_accounts() {
 # with .rotate==true. Backends are always excluded (explicit-only).
 # api accounts with rotate==false (the safety default) are also excluded.
 cr_enabled_accounts() {
-  cr_config_read | jq -r '.accounts[]
+  local provider="${1:-${CR_PROVIDER:-claude}}"
+  cr_config_read | jq -r --arg p "$provider" '.accounts[]
+    | select((.provider // "claude") == $p)
     | select(.enabled != false)
     | select(
         ((.kind // "subscription") == "subscription")
@@ -221,9 +316,10 @@ cr_exhausted_threshold() {
 # callers fall back to all enabled rather than hard-failing.
 # api accounts have usagePct=null (pay-per-token) → always count as available.
 cr_available_accounts() {
-  local thr; thr="$(cr_exhausted_threshold)"
-  cr_config_read | jq -r --argjson t "$thr" '
+  local provider="${1:-${CR_PROVIDER:-claude}}" thr; thr="$(cr_exhausted_threshold)"
+  cr_config_read | jq -r --arg p "$provider" --argjson t "$thr" '
     .accounts[]
+    | select((.provider // "claude") == $p)
     | select(.enabled != false)
     | select(
         ((.kind // "subscription") == "subscription")
@@ -236,29 +332,32 @@ cr_available_accounts() {
 # Echo the available pool, or fall back to all enabled if none are available.
 # Also sets CR_POOL_FELL_BACK=1 when it had to fall back (all exhausted).
 cr_selection_pool() {
+  local provider="${1:-${CR_PROVIDER:-claude}}"
   CR_POOL_FELL_BACK=0
-  local out; out="$(cr_available_accounts)"
-  if [[ -z "$out" ]]; then CR_POOL_FELL_BACK=1; cr_enabled_accounts; else printf '%s\n' "$out"; fi
+  local out; out="$(cr_available_accounts "$provider")"
+  if [[ -z "$out" ]]; then CR_POOL_FELL_BACK=1; cr_enabled_accounts "$provider"; else printf '%s\n' "$out"; fi
 }
 
 # round-robin: advance cursor over the available pool, persist, return chosen.
 cr_select_round_robin() {
+  local provider="${1:-${CR_PROVIDER:-claude}}"
   local -a pool
-  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool "$provider")
   local n=${#pool[@]}
   ((n == 0)) && return 1
   local cursor
-  cursor="$(cr_config_read | jq -r '.rotation.cursor // 0')"
+  cursor="$(cr_provider_cursor "$provider")"
   local idx=$(( cursor % n ))
   local next=$(( (idx + 1) % n ))
-  cr_config_update '.rotation.cursor = ($c|tonumber)' --arg c "$next" >/dev/null
+  cr_provider_set_cursor "$provider" "$next"
   printf '%s' "${pool[$idx]}"
 }
 
 # lru: account in the available pool with the smallest lastUsed.
 cr_select_lru() {
+  local provider="${1:-${CR_PROVIDER:-claude}}"
   local -a pool
-  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool "$provider")
   ((${#pool[@]} == 0)) && return 1
   # Build a jq filter restricting to the pool, then pick min lastUsed.
   local names_json; names_json="$(printf '%s\n' "${pool[@]}" | jq -R . | jq -cs .)"
@@ -269,8 +368,9 @@ cr_select_lru() {
 
 # random: a uniformly random account from the available pool.
 cr_select_random() {
+  local provider="${1:-${CR_PROVIDER:-claude}}"
   local -a pool
-  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool)
+  while IFS= read -r line; do [[ -n "$line" ]] && pool+=("$line"); done < <(cr_selection_pool "$provider")
   local n=${#pool[@]}
   ((n == 0)) && return 1
   printf '%s' "${pool[$(( RANDOM % n ))]}"
@@ -282,24 +382,25 @@ cr_select_random() {
 # accounts; backends and rotate=false api accounts are never considered).
 # Falls back to lru when no rotation-pool account has a cached usagePct.
 cr_select_usage_aware() {
-  local name
-  name="$(cr_config_read | jq -r '
+  local provider="${1:-${CR_PROVIDER:-claude}}" name
+  name="$(cr_config_read | jq -r --arg p "$provider" '
     [.accounts[]
+     | select((.provider // "claude") == $p)
      | select(.enabled != false)
      | select(((.kind // "subscription") == "subscription") or ((.kind == "api") and (.rotate == true)))
      | select(.usagePct != null)]
     | sort_by(.usagePct) | .[0].name // empty')"
-  if [[ -n "$name" ]]; then printf '%s' "$name"; else cr_select_lru; fi
+  if [[ -n "$name" ]]; then printf '%s' "$name"; else cr_select_lru "$provider"; fi
 }
 
 # Dispatch on a policy name. Echoes chosen account.
 cr_select() {
-  local policy="$1"
+  local policy="$1" provider="${2:-${CR_PROVIDER:-claude}}"
   case "$policy" in
-    round-robin) cr_select_round_robin ;;
-    lru)         cr_select_lru ;;
-    random)      cr_select_random ;;
-    usage-aware) cr_select_usage_aware ;;
+    round-robin) cr_select_round_robin "$provider" ;;
+    lru)         cr_select_lru "$provider" ;;
+    random)      cr_select_random "$provider" ;;
+    usage-aware) cr_select_usage_aware "$provider" ;;
     *) return 2 ;;
   esac
 }

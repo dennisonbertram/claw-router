@@ -120,6 +120,45 @@ cr_usage_pct() {
   ' 2>/dev/null
 }
 
+# Fetch Codex ChatGPT limits through the official app-server account surface and
+# normalize primary/secondary windows into the existing Claude-shaped internal
+# representation. API-key and older/unavailable servers return nonzero.
+cr_fetch_codex_usage_raw() {
+  local dir="$1" result snapshot
+  result="$(cr_codex_read_rate_limits "$dir")" || return 1
+  snapshot="$(printf '%s' "$result" | jq -c '
+    if (.rateLimitsByLimitId.codex // null) != null then .rateLimitsByLimitId.codex
+    else .rateLimits end' 2>/dev/null)" || return 1
+  [[ -n "$snapshot" && "$snapshot" != "null" ]] || return 1
+  printf '%s' "$snapshot" | jq -e '
+    def label($w; $fallback):
+      if ($w.windowDurationMins // null) == 300 then "5h session"
+      elif ($w.windowDurationMins // null) == 10080 then "7d total"
+      elif ($w.windowDurationMins // null) != null then "\($w.windowDurationMins)m window"
+      else $fallback end;
+    def window($w; $fallback):
+      if $w == null then null else {
+        utilization: $w.usedPercent,
+        resets_at: (if $w.resetsAt == null then null else ($w.resetsAt | todate) end),
+        label: label($w; $fallback)
+      } end;
+    {five_hour: window(.primary; "primary"), seven_day: window(.secondary; "secondary")}
+    | select((.five_hour != null) or (.seven_day != null))' 2>/dev/null
+}
+
+cr_fetch_account_usage_raw() {
+  local name="$1" dir provider kind
+  dir="$(cr_account_dir "$name")" || return 1
+  provider="$(cr_account_provider "$name")"
+  kind="$(cr_account_kind "$name")"
+  [[ "$kind" == "subscription" ]] || return 1
+  if [[ "$provider" == "codex" ]]; then
+    cr_fetch_codex_usage_raw "$dir"
+  else
+    cr_fetch_usage_raw "$dir"
+  fi
+}
+
 # --- Pretty meters -------------------------------------------------------
 
 # Format an ISO-8601 reset time as a compact "in 2h11m" / "in 3d04h" delta.
@@ -163,7 +202,7 @@ cr_bar_color() {
 cr_render_account_meters() {
   local name="$1" dir raw email pct
   dir="$(cr_account_dir "$name")" || { cr_warn "unknown account: $name"; return 1; }
-  raw="$(cr_fetch_usage_raw "$dir")" || { cr_warn "usage unavailable for '$name' (try: cr login $name)"; return 1; }
+  raw="$(cr_fetch_account_usage_raw "$name")" || { cr_warn "usage unavailable for '$name' (try: cr login $name)"; return 1; }
 
   email="$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.email // ""')"
   pct="$(cr_usage_pct "$raw")"
@@ -187,8 +226,8 @@ cr_render_account_meters() {
     fi
   done < <(printf '%s' "$raw" | jq -r '
     . as $r
-    | [ {k:"five_hour",      lab:"5h session"},
-        {k:"seven_day",      lab:"7d total"},
+    | [ {k:"five_hour",      lab:(.five_hour.label // "5h session")},
+        {k:"seven_day",      lab:(.seven_day.label // "7d total")},
         {k:"seven_day_opus", lab:"7d Opus"},
         {k:"seven_day_sonnet",lab:"7d Sonnet"} ]
     | .[]
@@ -214,7 +253,7 @@ cr_render_meters() {
     local a any=0
     while IFS= read -r a; do
       cr_render_account_meters "$a" && any=1 || true
-    done < <(cr_subscription_accounts)
+    done < <(cr_subscription_accounts "${CR_PROVIDER:-claude}")
     [[ "$any" -eq 0 ]] && cr_warn "no usage data available"
   fi
   printf '\n' >&2
@@ -228,7 +267,7 @@ cr_cache_usage() {
   now_ms="$(( $(date +%s) * 1000 ))"
   win_json="$(printf '%s' "$raw" | jq -c '
     . as $r
-    | [ {k:"five_hour",lab:"5h session"}, {k:"seven_day",lab:"7d total"},
+    | [ {k:"five_hour",lab:(.five_hour.label // "5h session")}, {k:"seven_day",lab:(.seven_day.label // "7d total")},
         {k:"seven_day_opus",lab:"7d Opus"}, {k:"seven_day_sonnet",lab:"7d Sonnet"} ]
     | map(. as $e | ($r[$e.k]) as $w | select($w != null)
           | {label:$e.lab, used:($w.utilization // $w), resets:($w.resets_at // null)})' 2>/dev/null)"
@@ -278,7 +317,7 @@ cr_render_cached_bars() {
       done < <(printf '%s' "$wins" | jq -r '.[] | "\(.label)\t\(.used)\t\(.resets // "")"')
     fi
     printf '\n' >&2
-  done < <(cr_subscription_accounts)
+  done < <(cr_subscription_accounts "${CR_PROVIDER:-claude}")
   return $(( any ? 0 : 1 ))
 }
 
@@ -301,12 +340,14 @@ cr_age_human() {
 # This adds a little latency to a launch only when the cache has gone stale.
 cr_refresh_usage_if_stale() {
   [[ -n "${CR_NO_AUTO_REFRESH:-}" ]] && return 0   # test/escape hatch
-  cr_have curl || return 0
+  local provider="${1:-${CR_PROVIDER:-claude}}"
+  [[ "$provider" != "claude" ]] || cr_have curl || return 0
   [[ "$(cr_config_read | jq -r '.autoRefreshUsage // true')" == "false" ]] && return 0
   local ttl now_s; ttl="$(cr_config_read | jq -r '.usageTtlSeconds // 900')"
   now_s="$(date +%s)"
-  local stale; stale="$(cr_config_read | jq -r --argjson now "$now_s" --argjson ttl "$ttl" '
+  local stale; stale="$(cr_config_read | jq -r --arg p "$provider" --argjson now "$now_s" --argjson ttl "$ttl" '
     .accounts[]
+    | select((.provider // "claude") == $p)
     | select(.enabled != false)
     | select((.kind // "subscription") == "subscription")
     | select(((.usage.checkedAt // 0) / 1000) < ($now - $ttl))
@@ -322,7 +363,7 @@ cr_refresh_usage_if_stale() {
 cr_poll_account() {
   local name="$1" dir raw pct line
   dir="$(cr_account_dir "$name")" || { cr_warn "unknown account: $name"; return 1; }
-  raw="$(cr_fetch_usage_raw "$dir")" || { cr_warn "usage poll failed for '$name'"; return 1; }
+  raw="$(cr_fetch_account_usage_raw "$name")" || { cr_warn "usage poll failed for '$name'"; return 1; }
   pct="$(cr_usage_pct "$raw")"
   if [[ -n "$pct" ]]; then
     cr_cache_usage "$name" "$pct" "$raw"

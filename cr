@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# cr — Claw Router 🦞. Pick one of your Claude subscriptions and launch Claude
-# Code under it, spreading usage so it lasts longer.
+# cr — Claw Router 🦞. Route isolated Claude Code or OpenAI Codex accounts.
 #
 #   cr [claude args...]          route per policy, then exec claude
 #   cr --account <name> [...]    force an account
-#   cr@<name> [...]              shorthand for --account <name>
+#   cr @<name> [...]             shorthand for --account <name>
 #
 # Management subcommands (NOT passed to claude):
 #   cr add <name>      cr login <name>   cr logout <name>   cr remove <name>
@@ -25,6 +24,8 @@ source "${CR_DIR}/lib/common.sh"
 source "${CR_DIR}/lib/usage.sh"
 # shellcheck source=lib/watch.sh
 source "${CR_DIR}/lib/watch.sh"
+# shellcheck source=providers/codex.sh
+source "${CR_DIR}/providers/codex.sh"
 
 # Env that would override subscription OAuth (see precedence in PLAN.md §1.3).
 CR_SCRUB_ENV=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN)
@@ -51,6 +52,11 @@ cr_find_claude() {
 CR_EXEC=()
 cr_build_exec() {
   CR_EXEC=()
+  if [[ "${CR_PROVIDER:-claude}" == "codex" ]]; then
+    local codex; codex="$(cr_find_codex)" || cr_die "could not find 'codex' on PATH"
+    CR_EXEC=("$codex")
+    return 0
+  fi
   if [[ "${CR_SANDBOX:-0}" == 1 ]]; then
     local cco; cco="$(command -v cco 2>/dev/null || true)"
     if [[ -z "$cco" ]]; then
@@ -101,7 +107,9 @@ cr_account_owning_session() {
       # Real file only: exists, is a regular file, and is NOT a symlink.
       if [[ -f "$f" && ! -L "$f" ]]; then printf '%s' "$name"; return 0; fi
     done
-  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
+  done < <(cr_config_read | jq -r '.accounts[]
+    | select((.provider // "claude") == "claude")
+    | select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
   return 1
 }
 
@@ -109,34 +117,39 @@ cr_launch() {
   local forced="$1"; shift
   cr_ensure_home
 
-  local policy account
-  policy="$(cr_config_read | jq -r '.selection // "round-robin"')"
+  local provider="${CR_PROVIDER:-claude}" policy account
+  policy="$(cr_provider_selection "$provider")"
 
   if [[ -n "$forced" ]]; then
     cr_account_exists "$forced" || cr_die "unknown account: $forced (try: cr list)"
+    local actual_provider; actual_provider="$(cr_account_provider "$forced")"
+    if [[ "$actual_provider" != "$provider" ]]; then
+      cr_die "account '$forced' belongs to provider '$actual_provider', not '$provider'"
+    fi
     account="$forced"
   else
-    local n; n="$(cr_enabled_accounts | grep -c . || true)"
+    local n; n="$(cr_enabled_accounts "$provider" | grep -c . || true)"
     if [[ "$n" -eq 0 ]]; then
       # No subscriptions to rotate. If a backend exists, name it in the hint.
       local be; be="$(cr_config_read | jq -r '[.accounts[]|select((.kind//"subscription")=="backend")][0].name // empty')"
       [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
-      cr_die "no accounts registered. Run: cr add <name>"
+      cr_die "no $provider accounts registered. Run: cr --provider $provider add <name>"
     fi
     # Keep usage fresh enough that "skip exhausted accounts" actually works.
     # Refreshes in the background only when the cache is stale (best-effort).
-    [[ "$n" -gt 1 ]] && cr_refresh_usage_if_stale
+    [[ "$n" -gt 1 ]] && cr_refresh_usage_if_stale "$provider"
     if [[ "$n" -eq 1 ]]; then
-      account="$(cr_enabled_accounts | head -1)"
+      account="$(cr_enabled_accounts "$provider" | head -1)"
     else
-      account="$(cr_select "$policy")" || cr_die "selection failed for policy '$policy'"
+      account="$(cr_select "$policy" "$provider")" || cr_die "selection failed for policy '$policy'"
     fi
   fi
 
   # Resume/continue: make sure the chosen account can see the session. If another
   # account owns it, transparently symlink it in so the resume just works.
-  local rkind sid; rkind="$(cr_args_resume_kind "$@" || true)"
-  if [[ -n "$rkind" ]]; then
+  local rkind sid; rkind=""
+  [[ "$provider" != "claude" ]] || rkind="$(cr_args_resume_kind "$@" || true)"
+  if [[ "$provider" == "claude" && -n "$rkind" ]]; then
     sid="${rkind#resume }"; [[ "$rkind" == "$sid" ]] && sid=""   # set only for `resume <id>`
     if [[ -n "$sid" ]]; then
       if cr_link_session "$sid" "$account" >/dev/null 2>&1; then
@@ -148,6 +161,11 @@ cr_launch() {
 
   local kind; kind="$(cr_account_kind "$account")"
   cr_mark_used "$account"
+
+  if [[ "$provider" == "codex" ]]; then
+    cr_launch_codex "$account" "$forced" "$policy" "$@"
+    return
+  fi
 
   if [[ "$kind" == "backend" ]]; then
     if [[ "${CR_WATCH:-0}" == 1 ]]; then
@@ -207,6 +225,31 @@ cr_launch() {
     cr_watch_run "$account" "$policy" "$@"
     # cr_watch_run never returns (exits directly).
   fi
+
+  cr_build_exec
+  exec "${CR_EXEC[@]}" "$@"
+}
+
+# Launch OpenAI Codex with the selected CODEX_HOME. Codex arguments are passed
+# byte-for-byte as argv; notably -s/--sandbox belongs to Codex, not this router.
+cr_launch_codex() {
+  local account="$1" forced="$2" policy="$3"; shift 3
+  local dir email plan
+  dir="$(cr_account_dir "$account")" || cr_die "cannot resolve dir for '$account'"
+  email="$(cr_config_read | jq -r --arg n "$account" '.accounts[]|select(.name==$n)|.email // "?"')"
+  plan="$(cr_config_read | jq -r --arg n "$account" '.accounts[]|select(.name==$n)|.plan // "?"')"
+
+  cr_codex_prepare_env "$dir"
+  if [[ "${CR_WATCH:-0}" == 1 ]]; then
+    cr_warn "watch: Codex session handoff is not supported yet — launching normally"
+    CR_WATCH=0
+  fi
+
+  printf '%s◆%s %s%s%s %s%s%s %s(%s)%s %s%s%s\n' \
+    "$C_ACCENT" "$C_RESET" "$C_BOLD" "$account" "$C_RESET" \
+    "$C_GREY" "$email" "$C_RESET" "$C_GREY" "$plan" "$C_RESET" \
+    "$C_DIM" "$([[ -n "$forced" ]] && echo "· forced · codex" || echo "· $policy · codex")" "$C_RESET" >&2
+  printf '%s\t%s\tcodex:%s\n' "$(date -u +%FT%TZ)" "$account" "${dir:-(default)}" >> "$CR_LOG" 2>/dev/null || true
 
   cr_build_exec
   exec "${CR_EXEC[@]}" "$@"

@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Claw Router — one command, all your Claude accounts</title>
-<meta name="description" content="A tiny wrapper around Claude Code that spreads your sessions across all your Claude subscriptions — round-robin, least-recently-used, or wherever the headroom is — so no single plan burns out first.">
+<title>Claw Router — route Claude Code and OpenAI Codex accounts</title>
+<meta name="description" content="A provider-aware account router for Claude Code and OpenAI Codex CLI, with isolated logins, provider-scoped policies, usage, status, and native argument forwarding.">
 <meta name="theme-color" content="#f2eee2">
 <link rel="canonical" href="https://dennisonbertram.github.io/claw-router/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Claw Router — one command, all your Claude accounts">
-<meta property="og:description" content="Effortlessly manage your Claude subscriptions. One command. All your accounts. Used evenly, so they last.">
+<meta property="og:title" content="Claw Router — Claude and Codex, one account router">
+<meta property="og:description" content="Route Claude Code and OpenAI Codex accounts without moving credentials or giving up either CLI's native workflow.">
 <meta property="og:image" content="https://dennisonbertram.github.io/claw-router/assets/thumbnail.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
@@ -32,8 +32,8 @@
 
 <section class="hero" id="top">
   <div class="hero__inner">
-    <h1 class="reveal" style="--i:0">One command. <em>All</em> your Claude accounts.</h1>
-    <p class="hero__lede reveal" style="--i:1"><code>cr</code> is a tiny wrapper around Claude&nbsp;Code. Each launch, it picks one of your Claude subscriptions, says which, and gets out of the way — spreading the load so no single plan burns out first.</p>
+    <h1 class="reveal" style="--i:0">One router. <em>Claude</em> and Codex accounts.</h1>
+    <p class="hero__lede reveal" style="--i:1"><code>cr</code> keeps Claude&nbsp;Code as the zero-friction default and adds provider-aware routing for OpenAI Codex CLI. Pick a provider or name an account; the right isolated login and native CLI take it from there.</p>
     <p class="hero__actions reveal" style="--i:2">
       <a class="link" href="#stage-setup">Jump to install&nbsp;↓</a>
       <a class="link" href="https://github.com/dennisonbertram/claw-router">View on GitHub&nbsp;↗</a>
@@ -81,18 +81,18 @@
       <hr class="stage__rule" aria-hidden="true">
       <h2><span class="stage__num">2.0</span>The trick.</h2>
       <div class="prose">
-        <p>Claude&nbsp;Code keys its credentials off a single environment variable. Each distinct <code>CLAUDE_CONFIG_DIR</code> gets its own isolated macOS Keychain login — so <code>cr</code> keeps one directory per account, and on every launch it:</p>
+        <p>Claude&nbsp;Code and Codex expose different isolation and command contracts. <code>cr</code> keeps those differences behind provider adapters: Claude accounts use <code>CLAUDE_CONFIG_DIR</code>; Codex accounts use <code>CODEX_HOME</code>. On every launch it:</p>
         <ol>
-          <li>picks an account by policy — or your forced <code>--account</code>,</li>
-          <li>unsets <code>ANTHROPIC_API_KEY</code> and friends, which would otherwise override your subscription login,</li>
-          <li>points <code>CLAUDE_CONFIG_DIR</code> at the chosen account,</li>
+          <li>keeps Claude as the default, accepts <code>--provider codex</code>, or infers the provider from a named account,</li>
+          <li>picks an account from that provider's own policy pool,</li>
+          <li>points the provider's isolated home at the chosen account,</li>
           <li>prints a one-line banner to <strong>stderr</strong>, and</li>
-          <li><code>exec</code>s the real <code>claude</code> — TTY, signals, and exit code pass straight through, with zero overhead.</li>
+          <li><code>exec</code>s the real <code>claude</code> or <code>codex</code> — native arguments, TTY, signals, and exit code pass straight through.</li>
         </ol>
       </div>
       <aside class="aside-note">
         <p class="aside-note__head">Your secrets never move.</p>
-        <p><code>cr</code> never reads, copies, or stores credentials. Claude&nbsp;Code reads its own Keychain login and refreshes its own token — <code>cr</code> only decides <em>which</em> login it reads.</p>
+        <p><code>cr</code> never moves credentials between accounts or providers. Codex login, logout, and health checks use official Codex commands under the selected <code>CODEX_HOME</code>; Claw Router never reads Codex credentials. Claude usage polling retains its existing provider-specific path.</p>
       </aside>
     </li>
 
@@ -112,7 +112,7 @@ cd claw-router
 ./install.sh   <span class="c"># symlinks `cr` into ~/.local/bin</span></code></pre>
       </div>
       <div class="prose">
-        <p>Then teach it your accounts. Your existing <code>~/.claude</code> login is adopted as <code>default</code> — never moved, never modified.</p>
+        <p>Then teach it your accounts. Your existing <code>~/.claude</code> login can remain the Claude default. Codex accounts get isolated homes and the official browser login flow.</p>
       </div>
       <div class="codeblock">
         <div class="codeblock__bar">
@@ -122,7 +122,9 @@ cd claw-router
         <pre id="accounts-sh"><code>cr register-default   <span class="c"># adopt your current ~/.claude login</span>
 cr add work           <span class="c"># create + browser-login a second account</span>
 cr add personal       <span class="c"># …and a third</span>
-cr list               <span class="c"># see them all</span></code></pre>
+cr --provider codex add openai-work <span class="c"># isolated CODEX_HOME + codex login</span>
+cr list               <span class="c"># Claude accounts</span>
+cr --provider codex list <span class="c"># Codex accounts</span></code></pre>
       </div>
     </li>
 
@@ -130,7 +132,7 @@ cr list               <span class="c"># see them all</span></code></pre>
       <hr class="stage__rule" aria-hidden="true">
       <h2><span class="stage__num">4.0</span>The flow.</h2>
       <div class="prose">
-        <p>From here on, type <code>cr</code> wherever you typed <code>claude</code>. Anything it doesn’t recognize is forwarded verbatim — flags, prompts, <code>--resume</code>, all of it. The only visible difference is one quiet line saying who’s at the helm.</p>
+        <p>Plain <code>cr</code> remains a drop-in Claude route. Use <code>cr --provider codex</code> for Codex, or <code>cr @name</code> to infer the provider from an account. Provider-native commands stay native: Claude <code>--resume</code>, Codex <code>exec</code> and <code>resume</code>, and each CLI's own flags.</p>
       </div>
       <div class="codeblock">
         <div class="codeblock__bar">
@@ -142,7 +144,11 @@ cr list               <span class="c"># see them all</span></code></pre>
 
 $ cr -p "and the tests?"
 <span class="s">◆ personal</span>  you@gmail.com  (claude_max) · round-robin
-<span class="o">…next call, next account…</span></code></pre>
+<span class="o">…next call, next account…</span>
+
+$ cr --provider codex exec "and the Codex tests?"
+<span class="a">◆ openai-work</span>  [codex] · round-robin
+<span class="o">…codex runs normally…</span></code></pre>
       </div>
       <div class="prose">
         <p>Four ways to pick the next account:</p>
@@ -158,7 +164,7 @@ $ cr -p "and the tests?"
         <dd>Whichever account has the most headroom right now, by the numbers from <code>cr usage</code>.</dd>
       </dl>
       <div class="prose">
-        <p style="margin-top: var(--space-lg)">Pin one with <code>cr use work</code> when you want stillness; force a single launch with <code>cr@work</code> when you don’t.</p>
+        <p style="margin-top: var(--space-lg)">Policies and pins are provider-scoped: <code>cr policy usage-aware</code> targets Claude, while <code>cr --provider codex policy lru</code> targets Codex. Force one account with <code>cr @work</code>; its provider is inferred.</p>
       </div>
     </li>
 
@@ -166,7 +172,7 @@ $ cr -p "and the tests?"
       <hr class="stage__rule" aria-hidden="true">
       <h2><span class="stage__num">5.0</span>The balance.</h2>
       <div class="prose">
-        <p><code>cr usage</code> draws how much is left in each window — the 5-hour session, the 7-day total — with reset countdowns, so you can see at a glance which subscription to lean on.</p>
+        <p><code>cr usage</code> draws how much is left in each provider-supported window. Claude keeps its existing meters; Codex ChatGPT usage, when available through the official app-server interface, is normalized into the same display. API-key and no-data accounts degrade gracefully instead of blocking routing.</p>
       </div>
       <figure class="meters">
         <figcaption>usage left per window — from the README’s own example</figcaption>
@@ -202,7 +208,7 @@ $ cr -p "and the tests?"
         </div>
       </figure>
       <div class="prose">
-        <p>And every policy <strong>skips exhausted accounts</strong>. Before routing, <code>cr</code> refreshes stale usage data and drops any account at or above the exhaustion threshold from the rotation — a maxed-out subscription is never chosen. If <em>every</em> account is spent, it falls back to the full set rather than failing. Tune it to taste:</p>
+        <p>Within each provider, policies <strong>skip exhausted accounts</strong> when current usage is available. Before routing, <code>cr</code> refreshes stale usage data and drops any account at or above the exhaustion threshold. If <em>every</em> account is spent, it falls back to the full set rather than failing. Tune it to taste:</p>
       </div>
       <div class="codeblock">
         <div class="codeblock__bar">
@@ -216,9 +222,9 @@ cr config ttl 600           <span class="c"># cached usage goes stale after 10 m
 
     <li class="stage" id="stage-handoff">
       <hr class="stage__rule" aria-hidden="true">
-      <h2><span class="stage__num">6.0</span>The handoff.</h2>
+      <h2><span class="stage__num">6.0</span>The Claude handoff.</h2>
       <div class="prose">
-        <p>Routing well at launch still leaves one wall: the account you’re <em>on</em> can run dry mid-session. Add <code>--watch</code> (or <code>-w</code>) and <code>cr</code> stays at the helm — a background watcher polls usage, and when the account in use crosses the threshold (90% by default) while another has headroom, it waits for a quiet moment, then restarts Claude&nbsp;Code under the fresher account with <code>--resume</code>. The conversation follows; you lose a few seconds of restart, not your context.</p>
+        <p>Routing well at launch still leaves one wall: the Claude account you’re <em>on</em> can run dry mid-session. Add <code>--watch</code> (or <code>-w</code>) and <code>cr</code> stays at the helm — a background watcher polls usage, waits for a quiet moment, then restarts Claude&nbsp;Code under a fresher account with <code>--resume</code>. Watch and cross-account session adoption are Claude-only. Codex keeps its native <code>resume</code> workflow and session ownership.</p>
       </div>
       <div class="codeblock">
         <div class="codeblock__bar">

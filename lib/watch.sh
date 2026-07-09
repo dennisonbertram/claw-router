@@ -71,7 +71,9 @@ cr_watch_latest_session() {
         best_path="$f"
       fi
     done
-  done < <(cr_config_read | jq -r '.accounts[]|select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
+  done < <(cr_config_read | jq -r '.accounts[]
+    | select((.provider // "claude") == "claude")
+    | select((.kind//"subscription")=="subscription" or .kind=="api")|.name')
 
   if [[ -z "$best_sid" ]]; then
     return 1
@@ -109,6 +111,7 @@ cr_watch_pick_next() {
   local current_account="$1" at_pct="$2"
   cr_config_read | jq -r --arg cur "$current_account" --argjson at "$at_pct" '
     [.accounts[]
+     | select((.provider // "claude") == "claude")
      | select(.enabled != false)
      | select((.kind // "subscription") == "subscription")
      | select(.name != $cur)
@@ -179,6 +182,7 @@ cr_watch_watcher() {
         [[ -z "$other" || "$other" == "$account" ]] && continue
         cr_poll_account "$other" >/dev/null 2>&1 || true
       done < <(cr_config_read | jq -r '.accounts[]
+        | select((.provider // "claude") == "claude")
         | select(.enabled != false)
         | select((.kind//"subscription")=="subscription")
         | .name')
