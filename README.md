@@ -105,7 +105,8 @@ cr -p "hello"             # round-robins across them
 ```sh
 cr --provider codex add openai-work      # isolated CODEX_HOME + official codex login
 cr --provider codex add openai-personal  # add another ChatGPT/Codex account
-cr --provider codex list                 # provider-scoped account view
+cr --provider codex add-api openai-api --from-env # optional API-key account
+cr list                                  # all accounts, with a provider column
 cr --provider codex                      # interactive Codex, routed by Codex policy
 cr --provider codex exec "explain this repo"  # native non-interactive Codex command
 cr @openai-work resume --last            # account name infers Codex
@@ -130,12 +131,13 @@ Launch (provider-native arguments are forwarded verbatim):
 | `cr --watch` / `-w [args…]` | Claude-only supervised handoff near the usage limit |
 | `cr --account <name> -- [args…]` | `--` ends router flags; the rest belongs to the selected provider CLI |
 
-Manage (never forwarded to claude):
+Manage (handled by the router or the selected provider adapter):
 
 | Command | Effect |
 |---|---|
 | `cr add <name>` | make an account dir, symlink shared settings, browser-login, cache identity |
 | `cr --provider codex add <name>` | make an isolated `CODEX_HOME` and run official `codex login` |
+| `cr --provider codex add-api <name> [--from-env] [--rotate]` | give an API key to `codex login --with-api-key`; explicit-only unless `--rotate` |
 | `cr add-backend <name> …` | register an alt-model endpoint (e.g. DeepSeek); see Backends below |
 | `cr add-api <name>` | register an Anthropic API key account (explicit-only by default) |
 | `cr rotate <name> on\|off` | opt an api-key account in or out of rotation |
@@ -143,7 +145,7 @@ Manage (never forwarded to claude):
 | `cr relink [--all\|<name>]` | re-apply `~/.claude` sharing to existing accounts (run once after upgrading) |
 | `cr [--provider <p>] login <name>` / `logout <name>` | run the provider's official authentication command |
 | `cr remove <name>` | unregister (prints how to delete its dir + keychain item) |
-| `cr [--provider <p>] list` (`accounts`, `ls`) | provider-scoped account table |
+| `cr list` (`accounts`, `ls`) | all accounts, with provider, identity, last-used, usage, and rotation state |
 | `cr use <name>` | pin the account a plain `cr` uses (overrides rotation) |
 | `cr use --clear` (`cr unuse`) | un-pin; go back to the rotation policy |
 | `cr [--provider <p>] policy <policy>` | provider-scoped `round-robin` \| `lru` \| `random` \| `usage-aware` |
@@ -218,6 +220,19 @@ cr --provider codex doctor openai-work
 cr --provider codex logout openai-work
 ```
 
+For an OpenAI API-key account, use a hidden prompt or `--from-env`:
+
+```sh
+cr --provider codex add-api openai-api
+cr --provider codex add-api openai-ci --from-env # reads an existing OPENAI_API_KEY
+cr --provider codex add-api openai-personal --rotate
+```
+
+The key is piped to `codex login --with-api-key`. Claw Router does not persist
+or read it; Codex owns the resulting login under that account's `CODEX_HOME`.
+Codex API-key accounts are explicit-only unless `--rotate` is supplied, and
+they have no subscription usage windows.
+
 Provider selection is explicit unless an account supplies it:
 
 ```sh
@@ -235,8 +250,9 @@ Codex limitations are deliberate:
 - Codex `resume` is forwarded as a native subcommand. It is not translated into
   Claude's `--resume` form.
 - `-s` / `--sandbox` is forwarded to Codex. The `cco` integration is Claude-only.
-- Usage may be unavailable for API-key or unsupported Codex sessions; status,
-  routing, and the menu bar continue with a no-data state.
+- Codex API-key accounts have no subscription usage windows. Other Codex usage
+  may also be unavailable; status, routing, and the menu bar continue with a
+  no-data state.
 
 ## API-key accounts
 
@@ -372,7 +388,7 @@ Bypasses (watch silently degrades and runs normally):
 - Only one enabled subscription account — nowhere to hand off to.
 - Codex accounts — use native `codex resume`; cross-account watch handoff is not supported.
 
-`--watch` composes with `--sandbox` (best-effort: both flags are independent).
+For Claude, `--watch` composes with the `cco` `--sandbox` mode (best-effort: both flags are independent).
 
 ## Menu bar watcher
 

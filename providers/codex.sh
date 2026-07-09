@@ -70,11 +70,11 @@ cr_codex_app_server_request() {
   ) &
   pid=$!
 
-  printf '%s\n' '{"method":"initialize","id":0,"params":{"clientInfo":{"name":"claw-router","title":"Claw Router","version":"1"},"capabilities":{"experimentalApi":true}}}' >&8
+  printf '%s\n' '{"method":"initialize","id":0,"params":{"clientInfo":{"name":"claw-router","title":"Claw Router","version":"1"}}}' >&8
 
   local tries=0
-  while (( tries < 40 )); do
-    if IFS= read -r -t 0.25 line <&9; then
+  while (( tries < 5 )); do
+    if IFS= read -r -t 1 line <&9; then
       if [[ "$(printf '%s' "$line" | jq -r 'select(.id==0) | .id' 2>/dev/null)" == "0" ]]; then
         init="$line"; break
       fi
@@ -92,8 +92,8 @@ cr_codex_app_server_request() {
     fi
 
     tries=0
-    while (( tries < 40 )); do
-      if IFS= read -r -t 0.25 line <&9; then
+    while (( tries < 5 )); do
+      if IFS= read -r -t 1 line <&9; then
         if [[ "$(printf '%s' "$line" | jq -r 'select(.id==1) | .id' 2>/dev/null)" == "1" ]]; then
           response="$line"; break
         fi
@@ -136,4 +136,3 @@ cr_codex_cache_identity() {
     --arg n "$name" --arg e "$email" --arg pl "$plan" --arg at "$auth_type" \
     --arg old "$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.plan // "unknown"')" >/dev/null
 }
-

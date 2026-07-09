@@ -111,18 +111,12 @@ cr_config_write() {
 }
 
 # Portable mkdir-based config lock. macOS ships Bash 3.2 without flock, so the
-# lock is an atomic directory with a pid marker. A dead owner's lock is removed;
-# live writers wait for at most ~10 seconds rather than silently racing.
+# lock is an atomic directory with a pid marker. Writers wait for at most ~10
+# seconds rather than silently racing; the path in a timeout message makes a
+# lock left by a killed process straightforward to inspect and remove.
 cr_config_lock_acquire() {
-  local lock="${CR_CONFIG}.lock" tries=0 owner=""
+  local lock="${CR_CONFIG}.lock" tries=0
   while ! mkdir "$lock" 2>/dev/null; do
-    if [[ -f "$lock/pid" ]]; then
-      owner="$(cat "$lock/pid" 2>/dev/null || true)"
-      if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
-        rm -rf "$lock" 2>/dev/null || true
-        continue
-      fi
-    fi
     tries=$(( tries + 1 ))
     (( tries >= 200 )) && cr_die "timed out waiting for config lock: $lock"
     sleep 0.05

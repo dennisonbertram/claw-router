@@ -132,7 +132,7 @@ cr_launch() {
     if [[ "$n" -eq 0 ]]; then
       # No subscriptions to rotate. If a backend exists, name it in the hint.
       local be; be="$(cr_config_read | jq -r '[.accounts[]|select((.kind//"subscription")=="backend")][0].name // empty')"
-      [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr@$be ...  (or add one: cr add <name>)"
+      [[ -n "$be" ]] && cr_die "no subscription accounts to route. Use a backend explicitly: cr @$be ...  (or add one: cr add <name>)"
       cr_die "no $provider accounts registered. Run: cr --provider $provider add <name>"
     fi
     # Keep usage fresh enough that "skip exhausted accounts" actually works.
@@ -330,6 +330,10 @@ cr_launch_api() {
 
 cr_cmd_add() {
   local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr add <name>"
+  if [[ "${CR_PROVIDER:-claude}" == "codex" ]]; then
+    cr_cmd_add_codex "$name"
+    return
+  fi
   cr_ensure_home
   if cr_account_exists "$name"; then cr_die "account '$name' already exists"; fi
 
@@ -363,11 +367,35 @@ cr_cmd_add() {
   cr_doctor "$name" || true
 }
 
+cr_cmd_add_codex() {
+  local name="$1" dir codex
+  cr_ensure_home
+  cr_account_exists "$name" && cr_die "account '$name' already exists"
+  dir="${CR_ACCOUNTS_DIR}/${name}"
+  mkdir -p "$dir"
+  cr_codex_ensure_file_store "$dir" || cr_die "could not prepare Codex config in $dir"
+  codex="$(cr_find_codex)" || cr_die "could not find 'codex' on PATH"
+
+  cr_say "Logging in to Codex for account '$name' (a browser window may open)…"
+  if ! (cr_codex_prepare_env "$dir"; exec "$codex" login); then
+    cr_die "Codex login failed; account '$name' was not registered"
+  fi
+  cr_config_update '.accounts += [{
+      name:$n, provider:"codex", kind:"subscription", configDir:$d,
+      email:null, plan:"unknown", lastUsed:0, enabled:true, usagePct:null }]' \
+    --arg n "$name" --arg d "$dir"
+  cr_codex_cache_identity "$name" >/dev/null 2>&1 || true
+  local email; email="$(cr_config_read | jq -r --arg n "$name" '.accounts[]|select(.name==$n)|.email // empty')"
+  cr_say "Added Codex account '$name'${email:+ ($email)}."
+  cr_doctor "$name" || true
+}
+
 # Register a backend account (alternate model endpoint, e.g. DeepSeek).
-# Backends are NEVER in rotation — reach them with: cr@<name> / cr --account <name>.
+# Backends are NEVER in rotation — reach them with: cr @<name> / cr --account <name>.
 #   cr add-backend <name> [--base-url URL] [--model NAME]
 #                         [--alias short=full ...] [--seed-from-deep-claude]
 cr_cmd_add_backend() {
+  [[ "${CR_PROVIDER:-claude}" == "claude" ]] || cr_die "add-backend is supported only for the Claude provider"
   local name="${1:-}"; shift || true
   [[ -z "$name" ]] && cr_die "usage: cr add-backend <name> [--base-url URL] [--model NAME] [--alias s=full] [--seed-from-deep-claude]"
   cr_ensure_home
@@ -417,7 +445,7 @@ cr_cmd_add_backend() {
     --argjson al "$aliases" --arg store "$stored" --arg k "$key"
 
   cr_say "Added backend '$name' → $baseurl  (model=$model, key in $stored)."
-  cr_say "It is NOT in rotation. Use it explicitly:  cr@$name [--model pro|flash] [claude args...]"
+  cr_say "It is NOT in rotation. Use it explicitly:  cr @$name [--model pro|flash] [claude args...]"
 }
 
 # Register an Anthropic API-key account.
@@ -426,6 +454,10 @@ cr_cmd_add_backend() {
 # or --key <k> to supply inline (note: ends up in shell history).
 #   cr add-api <name> [--rotate] [--from-env] [--key <key>]
 cr_cmd_add_api() {
+  if [[ "${CR_PROVIDER:-claude}" == "codex" ]]; then
+    cr_cmd_add_codex_api "$@"
+    return
+  fi
   local name="${1:-}"; shift || true
   [[ -z "$name" ]] && cr_die "usage: cr add-api <name> [--rotate] [--from-env] [--key <key>]"
   cr_ensure_home
@@ -477,11 +509,56 @@ cr_cmd_add_api() {
 
   if [[ "$rotate" == "true" ]]; then
     cr_say "Added api-key account '$name' (key in $stored). It IS in rotation — a plain 'cr' may pick it."
-    cr_say "Use it explicitly with: cr@$name …  (opt out with: cr rotate $name off)"
+    cr_say "Use it explicitly with: cr @$name …  (opt out with: cr rotate $name off)"
   else
     cr_say "Added api-key account '$name' (key in $stored). It is EXPLICIT-ONLY — a plain 'cr' will never pick it."
-    cr_say "Use it with: cr@$name …  (opt into rotation: cr rotate $name on)"
+    cr_say "Use it with: cr @$name …  (opt into rotation: cr rotate $name on)"
   fi
+}
+
+# Register a Codex API-key login without storing the key in router config or a
+# router-owned keychain. Codex reads it from stdin and persists its own official
+# credential record under the isolated CODEX_HOME.
+cr_cmd_add_codex_api() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || cr_die "usage: cr --provider codex add-api <name> [--from-env] [--rotate]"
+  cr_ensure_home
+  cr_account_exists "$name" && cr_die "account '$name' already exists"
+  local from_env=0 rotate=false key="" dir codex
+  while (($#)); do
+    case "$1" in
+      --from-env) from_env=1; shift ;;
+      --rotate) rotate=true; shift ;;
+      --key) cr_die "Codex add-api does not accept --key (it leaks into shell history); use a hidden prompt or --from-env" ;;
+      *) cr_die "add-api: unknown flag '$1'" ;;
+    esac
+  done
+  if (( from_env )); then
+    key="${OPENAI_API_KEY:-${CODEX_API_KEY:-}}"
+    [[ -n "$key" ]] || cr_die "OPENAI_API_KEY (or CODEX_API_KEY) is not set"
+    cr_say "Using Codex API key from the environment (it will not be stored by Claw Router)."
+  else
+    printf 'Enter OpenAI API key for "%s" (input hidden): ' "$name" >&2
+    read -rs key; printf '\n' >&2
+    [[ -n "$key" ]] || cr_die "no key entered"
+  fi
+
+  dir="${CR_ACCOUNTS_DIR}/${name}"
+  mkdir -p "$dir"
+  cr_codex_ensure_file_store "$dir" || cr_die "could not prepare Codex config in $dir"
+  codex="$(cr_find_codex)" || cr_die "could not find 'codex' on PATH"
+  if ! printf '%s\n' "$key" | (cr_codex_prepare_env "$dir"; exec "$codex" login --with-api-key); then
+    key=""
+    cr_die "Codex API-key login failed; account '$name' was not registered"
+  fi
+  key=""
+  cr_config_update '.accounts += [{
+      name:$n, provider:"codex", kind:"api", configDir:$d,
+      email:null, plan:"api-key", lastUsed:0, enabled:true, usagePct:null,
+      rotate:($r=="true") }]' \
+    --arg n "$name" --arg d "$dir" --arg r "$rotate"
+  cr_say "Added Codex API-key account '$name'. The key is managed only by Codex."
+  [[ "$rotate" == "true" ]] || cr_say "It is explicit-only; opt in with: cr rotate $name on"
 }
 
 # Toggle .rotate for a kind=api account.
@@ -515,7 +592,7 @@ cr_cmd_rotate() {
       cr_say "$name: rotation ON — a plain 'cr' may now pick this account." ;;
     off)
       cr_config_update '(.accounts[] | select(.name==$n) | .rotate) = false' --arg n "$name"
-      cr_say "$name: rotation OFF — use cr@$name to reach it explicitly." ;;
+      cr_say "$name: rotation OFF — use cr @$name to reach it explicitly." ;;
     *) cr_die "usage: cr rotate <name> on|off" ;;
   esac
 }
@@ -525,6 +602,15 @@ cr_cmd_register_default() {
   local name="${1:-default}"
   cr_ensure_home
   cr_account_exists "$name" && cr_die "account '$name' already exists"
+  if [[ "${CR_PROVIDER:-claude}" == "codex" ]]; then
+    cr_config_update '.accounts += [{
+        name:$n, provider:"codex", kind:"subscription", configDir:null,
+        email:null, plan:"unknown", lastUsed:0, enabled:true, usagePct:null }]' \
+      --arg n "$name"
+    cr_codex_cache_identity "$name" >/dev/null 2>&1 || true
+    cr_say "Registered existing ~/.codex login as '$name'."
+    return
+  fi
   local email="" plan=""
   if [[ -f "${HOME}/.claude.json" ]]; then
     email="$(jq -r '.oauthAccount.emailAddress // ""'    "${HOME}/.claude.json" 2>/dev/null)"
@@ -542,6 +628,7 @@ cr_cmd_register_default() {
 # With <name>: relinks that one account.
 # With --all: same as no arg (explicit).
 cr_cmd_relink() {
+  [[ "${CR_PROVIDER:-claude}" == "claude" ]] || cr_die "relink is specific to Claude account homes"
   cr_ensure_home
 
   [[ $# -gt 1 ]] && cr_die "usage: cr relink [--all|<name>]"
@@ -555,7 +642,7 @@ cr_cmd_relink() {
       kind="$(cr_account_kind "$a" 2>/dev/null || true)"
       dir="$(cr_account_dir "$a" 2>/dev/null || true)"
       # Skip null-configDir default and backends.
-      if [[ -z "$dir" || "$kind" == "backend" ]]; then continue; fi
+      if [[ "$(cr_account_provider "$a")" != "claude" || -z "$dir" || "$kind" == "backend" ]]; then continue; fi
       cr_relink_account "$a"
       linked_count=$(( linked_count + 1 ))
     done < <(cr_config_read | jq -r '.accounts[].name')
@@ -591,7 +678,15 @@ cr_cmd_relink() {
 cr_cmd_login() {
   local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr login <name>"
   cr_account_exists "$name" || cr_die "unknown account: $name"
+  local provider; provider="$(cr_account_provider "$name")"
   local dir claude; dir="$(cr_account_dir "$name")"
+  if [[ "$provider" == "codex" ]]; then
+    local codex; codex="$(cr_find_codex)" || cr_die "could not find 'codex' on PATH"
+    [[ -z "$dir" ]] || cr_codex_ensure_file_store "$dir" || cr_die "could not prepare Codex config in $dir"
+    (cr_codex_prepare_env "$dir"; exec "$codex" login)
+    cr_codex_cache_identity "$name" >/dev/null 2>&1 || true
+    return
+  fi
   claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
   if [[ -n "$dir" ]]; then CLAUDE_CONFIG_DIR="$dir" "$claude" /login
   else "$claude" /login; fi
@@ -600,7 +695,13 @@ cr_cmd_login() {
 cr_cmd_logout() {
   local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr logout <name>"
   cr_account_exists "$name" || cr_die "unknown account: $name"
+  local provider; provider="$(cr_account_provider "$name")"
   local dir claude; dir="$(cr_account_dir "$name")"
+  if [[ "$provider" == "codex" ]]; then
+    local codex; codex="$(cr_find_codex)" || cr_die "could not find 'codex' on PATH"
+    (cr_codex_prepare_env "$dir"; exec "$codex" logout)
+    return
+  fi
   claude="$(cr_find_claude)" || cr_die "could not find 'claude' on PATH"
   if [[ -n "$dir" ]]; then CLAUDE_CONFIG_DIR="$dir" "$claude" /logout
   else "$claude" /logout; fi
@@ -611,7 +712,11 @@ cr_cmd_remove() {
   cr_account_exists "$name" || cr_die "unknown account: $name"
   local kind; kind="$(cr_account_kind "$name")"
   local dir; dir="$(cr_account_dir "$name" 2>/dev/null || true)"
-  cr_config_update 'del(.accounts[] | select(.name==$n))' --arg n "$name"
+  cr_config_update '
+    del(.accounts[] | select(.name==$n))
+    | (if .defaultAccount == $n then del(.defaultAccount) else . end)
+    | .providers = ((.providers // {}) | with_entries(
+        .value |= (if .defaultAccount == $n then del(.defaultAccount) else . end)))' --arg n "$name"
   cr_say "Unregistered '$name'."
   if [[ "$kind" == "backend" ]]; then
     if cr_have security && security find-generic-password -s "$CR_BACKEND_KEYCHAIN_SVC" -a "$name" >/dev/null 2>&1; then
@@ -636,25 +741,40 @@ cr_cmd_remove() {
 
 cr_cmd_use() {
   local name="${1:-}"; [[ -z "$name" ]] && cr_die "usage: cr use <name>  (or: cr use --clear)"
+  local provider="${CR_PROVIDER:-claude}"
   if [[ "$name" == "--clear" || "$name" == "none" ]]; then
-    cr_config_update 'del(.defaultAccount)'
-    cr_say "Cleared pinned account. Plain 'cr' now follows the '$(cr_config_read | jq -r '.selection')' policy."
+    if [[ "$provider" == "claude" ]]; then
+      cr_config_update 'del(.defaultAccount)'
+    else
+      cr_config_update '.providers = (.providers // {}) | .providers[$p] = (.providers[$p] // {}) | del(.providers[$p].defaultAccount)' --arg p "$provider"
+    fi
+    cr_say "Cleared pinned $provider account. Routing now follows the '$(cr_provider_selection "$provider")' policy."
     return 0
   fi
   cr_account_exists "$name" || cr_die "unknown account: $name"
-  cr_config_update '.defaultAccount = $n' --arg n "$name"
-  cr_say "Default account for plain 'cr' set to '$name'. (Note: overrides rotation policy. Undo with: cr use --clear)"
+  [[ "$(cr_account_provider "$name")" == "$provider" ]] || cr_die "account '$name' belongs to provider '$(cr_account_provider "$name")', not '$provider'"
+  if [[ "$provider" == "claude" ]]; then
+    cr_config_update '.defaultAccount = $n' --arg n "$name"
+  else
+    cr_config_update '.providers = (.providers // {}) | .providers[$p] = (.providers[$p] // {}) | .providers[$p].defaultAccount = $n' --arg p "$provider" --arg n "$name"
+  fi
+  cr_say "Pinned $provider account '$name'. (Undo with: cr --provider $provider use --clear)"
 }
 
 cr_cmd_unuse() { cr_cmd_use --clear; }
 
 cr_cmd_policy() {
-  local p="${1:-}"
+  local p="${1:-}" provider="${CR_PROVIDER:-claude}"
   case "$p" in
     round-robin|lru|random|usage-aware)
-      cr_config_update '.selection = $p' --arg p "$p"
-      cr_say "Selection policy set to '$p'." ;;
-    "") cr_say "Current policy: $(cr_config_read | jq -r '.selection')" ;;
+      if [[ "$provider" == "claude" ]]; then
+        cr_config_update '.selection = $v' --arg v "$p"
+      else
+        cr_config_update '.providers = (.providers // {}) | .providers[$provider] = (.providers[$provider] // {}) | .providers[$provider].selection = $v' \
+          --arg provider "$provider" --arg v "$p"
+      fi
+      cr_say "$provider selection policy set to '$p'." ;;
+    "") cr_say "Current $provider policy: $(cr_provider_selection "$provider")" ;;
     *) cr_die "unknown policy '$p' (round-robin|lru|random|usage-aware)" ;;
   esac
 }
@@ -712,15 +832,19 @@ cr_cmd_list() {
     cr_say "Register your current ~/.claude login with:  cr register-default"
     return 0
   fi
-  local pinned; pinned="$(printf '%s' "$rows" | jq -r '.defaultAccount // empty')"
+  local claude_pinned codex_pinned
+  claude_pinned="$(printf '%s' "$rows" | jq -r '.defaultAccount // empty')"
+  codex_pinned="$(printf '%s' "$rows" | jq -r '.providers.codex.defaultAccount // empty')"
   # Build the table uncolored (so `column -t` aligns on true widths), then tint
   # only whole lines afterwards — header bold, backend rows yellow, pinned row bold.
   local table
-  table="$(printf '%s\n' "$rows" | jq -r --arg PIN "$pinned" '
-    "NAME\tKIND\tEMAIL / ENDPOINT\tPLAN / MODEL\tLAST USED\tUSAGE\tON\tROTATES",
+  table="$(printf '%s\n' "$rows" | jq -r --arg CP "$claude_pinned" --arg OP "$codex_pinned" '
+    "NAME\tPROVIDER\tKIND\tEMAIL / ENDPOINT\tPLAN / MODEL\tLAST USED\tUSAGE\tON\tROTATES",
     (.accounts[] |
       ( (.kind // "subscription") ) as $k |
-      [ (if .name==$PIN then "★ "+.name else .name end),
+      ((.provider // "claude")) as $p |
+      [ (if ($p=="claude" and .name==$CP) or ($p=="codex" and .name==$OP) then "★ "+.name else .name end),
+        $p,
         $k,
         (if $k=="backend" then (.baseUrl // "?" | sub("^https?://";""))
          elif $k=="api" then "(api key)"
@@ -751,7 +875,8 @@ cr_cmd_list() {
       printf '  %s\n' "$line" >&2
     fi
   done <<< "$table"
-  [[ -n "$pinned" ]] && printf '\n  %s★ pinned via '\''cr use'\'' — clear with '\''cr use --clear'\''%s\n' "$C_DIM" "$C_RESET" >&2
+  printf '\n  %sclaude%s policy=%s%s%s%s' "$C_DIM" "$C_RESET" "$C_CYAN" "$(cr_provider_selection claude)" "$C_RESET" "$([[ -n "$claude_pinned" ]] && printf ' pinned=%s' "$claude_pinned")" >&2
+  printf '    %scodex%s policy=%s%s%s%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$(cr_provider_selection codex)" "$C_RESET" "$([[ -n "$codex_pinned" ]] && printf ' pinned=%s' "$codex_pinned")" >&2
   printf '\n' >&2
 }
 
@@ -772,16 +897,24 @@ cr_cmd_usage() {
     fi
   fi
 
-  cr_have curl || cr_die "cr usage needs curl"
+  if [[ "${CR_PROVIDER:-claude}" == "claude" ]]; then
+    cr_have curl || cr_die "cr usage needs curl"
+  fi
 
   if [[ "$plain" -eq 1 ]]; then
     if [[ -n "$name" ]]; then
-      cr_poll_account "$name" >&2
+      if ! cr_poll_account "$name" >&2; then
+        [[ "${CR_PROVIDER:-claude}" == "codex" ]] && return 0
+        return 1
+      fi
     else
-      local a; while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_subscription_accounts)
+      local a; while IFS= read -r a; do cr_poll_account "$a" >&2 || true; done < <(cr_subscription_accounts "${CR_PROVIDER:-claude}")
     fi
   else
-    cr_render_meters "$name"
+    if ! cr_render_meters "$name"; then
+      [[ "${CR_PROVIDER:-claude}" == "codex" ]] && return 0
+      return 1
+    fi
   fi
 }
 
@@ -842,12 +975,13 @@ cr_cmd_adopt() {
   [[ -z "$sid" || -z "$target" ]] && cr_die "usage: cr adopt <session-id> <target-account>"
   cr_ensure_home
   cr_account_exists "$target" || cr_die "unknown target account: $target"
+  [[ "$(cr_account_provider "$target")" == "claude" ]] || cr_die "Codex sessions cannot be adopted across account homes; use native 'codex resume'"
   [[ "$(cr_account_kind "$target")" == "backend" ]] && cr_die "backends don't store sessions; pick a subscription or api account"
 
   cr_link_session "$sid" "$target"
   case $? in
     0) cr_say "Adopted session ${sid:0:8}… → '${target}' (symlinked, shared history)."
-       cr_say "Resume it under the target with:  cr@${target} --resume ${sid}" ;;
+       cr_say "Resume it under the target with:  cr @${target} --resume ${sid}" ;;
     2) cr_die "'$target' already owns that session" ;;
     *) cr_die "no account owns session ${sid} (nothing to adopt)" ;;
   esac
@@ -855,6 +989,7 @@ cr_cmd_adopt() {
 
 cr_cmd_status() {
   cr_ensure_home
+  local provider="${CR_PROVIDER:-claude}"
 
   # Parse flags in any order: --refresh / -r and --json (any combination).
   local want_json=0 do_refresh=0
@@ -869,9 +1004,9 @@ cr_cmd_status() {
   # Optional: refresh live usage before drawing (otherwise use cached snapshot).
   # In --json mode we suppress the human "refreshing" line (send nothing to stdout).
   if [[ "$do_refresh" -eq 1 ]]; then
-    if cr_have curl; then
+    if [[ "$provider" == "codex" ]] || cr_have curl; then
       [[ "$want_json" -eq 0 ]] && cr_say "${C_DIM}refreshing usage…${C_RESET}"
-      local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_subscription_accounts)
+      local a; while IFS= read -r a; do cr_poll_account "$a" >/dev/null 2>&1 || true; done < <(cr_subscription_accounts "$provider")
     else
       cr_warn "curl not found — showing cached usage"
     fi
@@ -883,18 +1018,19 @@ cr_cmd_status() {
   fi
 
   local policy def n
-  policy="$(cr_config_read | jq -r '.selection // "round-robin"')"
-  def="$(cr_config_read | jq -r '.defaultAccount // empty')"
-  n="$(cr_enabled_accounts | grep -c . || true)"
-  printf '\n  %spolicy%s %s%s%s    %ssubscriptions%s %s%s%s%s\n' \
+  policy="$(cr_provider_selection "$provider")"
+  def="$(cr_provider_pinned "$provider")"
+  n="$(cr_enabled_accounts "$provider" | grep -c . || true)"
+  printf '\n  %sprovider%s %s%s%s    %spolicy%s %s%s%s    %saccounts%s %s%s%s%s\n' \
+    "$C_GREY" "$C_RESET" "$C_BOLD" "$provider" "$C_RESET" \
     "$C_GREY" "$C_RESET" "$C_CYAN" "$policy" "$C_RESET" \
     "$C_GREY" "$C_RESET" "$C_BOLD" "$n" "$C_RESET" \
     "$([[ -n "$def" ]] && printf '    %spinned%s %s%s%s' "$C_GREY" "$C_RESET" "$C_YELLOW" "$def" "$C_RESET")" >&2
   if [[ "$n" -gt 0 ]]; then
     local pick note
     if [[ -n "$def" ]]; then pick="$def"; note="pinned via 'cr use'"
-    elif [[ "$policy" == lru ]]; then pick="$(cr_select_lru)"; note="would pick now"
-    elif [[ "$policy" == usage-aware ]]; then pick="$(cr_select_usage_aware)"; note="most headroom"
+    elif [[ "$policy" == lru ]]; then pick="$(cr_select_lru "$provider")"; note="would pick now"
+    elif [[ "$policy" == usage-aware ]]; then pick="$(cr_select_usage_aware "$provider")"; note="most headroom"
     else pick=""; note="next in rotation — run a plain 'cr' to advance"; fi
     if [[ -n "$pick" ]]; then
       printf '  %snext%s   %s◆ %s%s %s(%s)%s\n' \
@@ -916,12 +1052,13 @@ cr_cmd_status() {
 # Reads ONLY cached config — no network. Called by cr_cmd_status when --json is set.
 # Schema version 1: bump when fields change in a breaking way.
 cr_emit_status_json() {
-  local cfg generated_at now_s policy pinned exhausted_pct ttl_s
+  local cfg generated_at now_s provider policy pinned exhausted_pct ttl_s
   cfg="$(cr_config_read)"
+  provider="${CR_PROVIDER:-claude}"
   generated_at="$(date -u +%FT%TZ)"
   now_s="$(date +%s)"
-  policy="$(printf '%s' "$cfg" | jq -r '.selection // "round-robin"')"
-  pinned="$(printf '%s' "$cfg" | jq -r '.defaultAccount // empty')"
+  policy="$(cr_provider_selection "$provider")"
+  pinned="$(cr_provider_pinned "$provider")"
   exhausted_pct="$(printf '%s' "$cfg" | jq -r '.exhaustedAtPct // 100')"
   ttl_s="$(printf '%s' "$cfg" | jq -r '.usageTtlSeconds // 900')"
 
@@ -933,10 +1070,10 @@ cr_emit_status_json() {
     next_name="$pinned"
     next_note="pinned via 'cr use'"
   elif [[ "$policy" == lru ]]; then
-    next_name="$(cr_select_lru 2>/dev/null || true)"
+    next_name="$(cr_select_lru "$provider" 2>/dev/null || true)"
     next_note="would pick now"
   elif [[ "$policy" == usage-aware ]]; then
-    next_name="$(cr_select_usage_aware 2>/dev/null || true)"
+    next_name="$(cr_select_usage_aware "$provider" 2>/dev/null || true)"
     next_note="most headroom"
   elif [[ "$policy" == random ]]; then
     next_name=""
@@ -949,6 +1086,7 @@ cr_emit_status_json() {
   printf '%s' "$cfg" | jq -S \
     --arg schema       "1" \
     --arg generatedAt  "$generated_at" \
+    --arg provider     "$provider" \
     --arg policy       "$policy" \
     --arg pinned       "$pinned" \
     --argjson exhaustedAtPct "$exhausted_pct" \
@@ -962,6 +1100,7 @@ cr_emit_status_json() {
     {
       schema: ($schema | tonumber),
       generatedAt: $generatedAt,
+      provider: $provider,
       policy: $policy,
       pinned: (if $pinned == "" then null else $pinned end),
       exhaustedAtPct: $exhaustedAtPct,
@@ -971,7 +1110,7 @@ cr_emit_status_json() {
         note: $nextNote
       },
       accounts: [
-        .accounts[] |
+        .accounts[] | select((.provider // "claude") == $provider) |
         . as $acct |
         ($acct.kind // "subscription") as $kind |
         (if   $kind == "subscription" then true
@@ -995,6 +1134,7 @@ cr_emit_status_json() {
         ($checkedAt == null or (($nowS - ($acct.usage.checkedAt // 0) / 1000) > $ttlSeconds)) as $stale |
         {
           name: $acct.name,
+          provider: ($acct.provider // "claude"),
           kind: $kind,
           email: ($acct.email // null),
           enabled: ($acct.enabled != false),
@@ -1026,9 +1166,23 @@ cr_doctor() {
   local name="${1:-}"
   local check
   check() {
-    local a dir svc kc kind
+    local a dir svc kc kind provider
     a="$1"
     kind="$(cr_account_kind "$a")"
+    provider="$(cr_account_provider "$a")"
+    if [[ "$provider" == "codex" ]]; then
+      dir="$(cr_account_dir "$a" 2>/dev/null || true)"
+      local codex; codex="$(cr_find_codex 2>/dev/null || true)"
+      if [[ -z "$codex" ]]; then
+        kc="codex CLI MISSING"
+      elif (cr_codex_prepare_env "$dir"; "$codex" login status >/dev/null 2>&1); then
+        kc="ok"
+      else
+        kc="MISSING (run: cr login $a)"
+      fi
+      cr_say "  $a: provider=codex  kind=$kind  dir=${dir:-(default ~/.codex)}  login=$kc"
+      return
+    fi
     if [[ "$kind" == "backend" ]]; then
       if cr_backend_key "$a" >/dev/null 2>&1; then kc="ok"; else kc="MISSING (re-run: cr add-backend)"; fi
       cr_say "  $a: backend  key=$kc  (explicit-only, not in rotation)"
@@ -1079,24 +1233,26 @@ cr_cmd_help() {
   head() { printf '\n%s%s%s\n' "$b" "$1" "$r" >&2; }
   ex()  { printf '  %s%-36s%s %s%s%s\n' "$gn" "$1" "$r" "$d" "$2" "$r" >&2; }
 
-  printf '\n  %s🦞 Claw Router%s %s(cr)%s  %s— effortlessly manage your Claude subscriptions%s\n' \
+  printf '\n  %s🦞 Claw Router%s %s(cr)%s  %s— route isolated Claude Code and OpenAI Codex accounts%s\n' \
     "$a$b" "$r" "$d" "$r" "$d" "$r" >&2
 
   head "Launch"
-  cmd "cr [claude args...]"          "pick an account by policy, then run claude"
+  cmd "cr [claude args...]"          "pick a Claude account by policy, then run claude"
+  cmd "cr --provider codex [args]"   "pick a Codex account, then run codex"
   cmd "cr --account <name> [args]" "force a specific account for this run"
-  cmd "cr@<name> [args]"           "shorthand for --account <name>"
-  cmd "cr --account <name> -- ..."   "everything after -- is passed to claude"
+  cmd "cr @<name> [args]"           "shorthand for --account <name> (provider inferred)"
+  cmd "cr --account <name> -- ..."   "everything after -- is passed to the provider CLI"
   cmd "cr --resume <id>"           "resume any session — auto-linked into the picked account"
-  cmd "cr --sandbox  (-s) [args]"  "run the session inside a cco sandbox (isolation)"
+  cmd "cr --sandbox  (-s) [args]"  "Claude-only router sandbox; Codex owns its native -s"
   cmd "cr --watch   (-w) [args]"   "auto-handoff to a fresher account near the usage limit"
 
   head "Accounts"
-  cmd "cr add <name>"              "browser-login a subscription, cache identity"
+  cmd "cr add <name>"              "browser-login a Claude subscription"
+  cmd "cr --provider codex add <name>" "browser-login an isolated Codex account"
   cmd "cr add-backend <name> ..."    "register an alt-model endpoint (e.g. DeepSeek)"
   cmd "cr add-api <name>"          "register an Anthropic API key (explicit-only by default)"
   cmd "cr rotate <name> on|off"    "opt an api-key account in/out of rotation"
-  cmd "cr register-default [name]" "adopt your existing ~/.claude login"
+  cmd "cr register-default [name]" "adopt ~/.claude (or ~/.codex with --provider codex)"
   cmd "cr relink [--all|<name>]"   "re-share skills/agents/plugins/hooks/MCP from ~/.claude into account(s)"
   cmd "cr login / logout <name>"   "(re)authenticate / sign out an account"
   cmd "cr remove <name>"           "unregister an account"
@@ -1127,12 +1283,13 @@ cr_cmd_help() {
   head "Examples"
   ex 'cr -p "summarize this repo"'  "one-shot, account picked by policy"
   ex "cr --dangerously-skip-permissions" "any claude flag is forwarded as-is"
-  ex 'cr@work -p "draft the PR"'     "force the 'work' subscription"
-  ex 'cr@deepseek --model flash ...'   "use a backend (DeepSeek), explicit only"
-  ex 'cr@work-key -p "…"'             "use an API key, billed per token (never auto-picked)"
+  ex 'cr @work -p "draft the PR"'     "force the 'work' subscription"
+  ex 'cr @deepseek --model flash ...'   "use a backend (DeepSeek), explicit only"
+  ex 'cr @work-key -p "…"'             "use an API key, billed per token (never auto-picked)"
+  ex 'cr --provider codex -s workspace-write' "forward Codex native sandbox flags verbatim"
   ex "cr policy usage-aware && cr usage" "route to whichever has most headroom"
 
-  printf '\n%s  Plain %scr%s%s rotates over subscriptions only — backends are explicit-only (%scr@<name>%s%s).%s\n' \
+  printf '\n%s  Plain %scr%s%s remains Claude. Select Codex with %scr --provider codex%s%s; backends are explicit-only.%s\n' \
     "$d" "$cy" "$r" "$d" "$cy" "$r" "$d" "$r" >&2
   printf '%s  The “which account” banner goes to stderr, so %scr -p%s%s output stays pipeable.%s\n\n' \
     "$d" "$cy" "$r" "$d" "$r" >&2
@@ -1144,46 +1301,78 @@ cr_cmd_help() {
 main() {
   cr_require_deps
 
-  # Extract the cr-owned --sandbox / -s and --watch / -w flags from the launch
-  # flags (everything up to a `--` separator, after which args belong to claude).
-  # Sets CR_SANDBOX and CR_WATCH.
-  CR_SANDBOX=0
-  CR_WATCH=0
-  local _a _rest=() _seen_sep=0
-  for _a in "$@"; do
-    if [[ "$_seen_sep" == 0 && ( "$_a" == "--sandbox" || "$_a" == "-s" ) ]]; then
-      CR_SANDBOX=1; continue
+  # Extract the global provider before interpreting provider-owned flags. Plain
+  # `cr` deliberately remains Claude. The router flag is recognized only before
+  # a `--` passthrough separator.
+  CR_PROVIDER="claude"
+  local provider_explicit=0 _seen_sep=0 _rest=() forced=""
+  while (($#)); do
+    if [[ "$_seen_sep" == 0 && "$1" == "--provider" ]]; then
+      [[ -n "${2:-}" ]] || cr_die "--provider needs claude or codex"
+      CR_PROVIDER="$2"; provider_explicit=1; shift 2
+      cr_validate_provider "$CR_PROVIDER" || cr_die "unknown provider '$CR_PROVIDER' (claude|codex)"
+      continue
     fi
-    if [[ "$_seen_sep" == 0 && ( "$_a" == "--watch" || "$_a" == "-w" ) ]]; then
-      CR_WATCH=1; continue
+    if [[ "$_seen_sep" == 0 && "$1" == "--account" ]]; then
+      [[ -n "${2:-}" ]] || cr_die "--account needs a name"
+      [[ -z "$forced" ]] || cr_die "--account may be specified only once"
+      forced="$2"; shift 2
+      continue
     fi
-    [[ "$_a" == "--" ]] && _seen_sep=1
-    _rest+=("$_a")
+    if [[ "$_seen_sep" == 0 && -z "$forced" && "$1" == @* && "$1" != "@" ]]; then
+      forced="${1#@}"; shift
+      continue
+    fi
+    [[ "$1" == "--" ]] && _seen_sep=1
+    _rest+=("$1"); shift
   done
-  # Guard the empty-array expansion: on bash 3.2 (macOS stock) under `set -u`,
-  # a bare "${_rest[@]}" with no elements is an "unbound variable" error — which
-  # is exactly the no-arg `cr` case. The ${arr[@]+…} form expands to nothing
-  # when empty instead of erroring.
   set -- ${_rest[@]+"${_rest[@]}"}
-  # Fail fast on --sandbox without cco, before any banner/launch side effects.
-  if [[ "$CR_SANDBOX" == 1 ]] && ! command -v cco >/dev/null 2>&1; then
-    cr_die "--sandbox needs 'cco' (not found). Install it:
-    curl -fsSL https://raw.githubusercontent.com/nikvdp/cco/master/install.sh | bash
-  then re-run, or drop --sandbox. See: https://github.com/nikvdp/cco"
-  fi
 
-  # cr@name shorthand
-  if [[ "${1:-}" == cr@* ]]; then set -- --account "${1#cr@}" "${@:2}"; fi
-
-  # Global --account <name> (before subcommand or before claude args)
-  local forced=""
-  if [[ "${1:-}" == "--account" ]]; then
-    forced="${2:-}"; [[ -z "$forced" ]] && cr_die "--account needs a name"
-    shift 2
-    # Drop an optional `--` separator between cr flags and claude args.
+  # Real shorthand is a separate argv token: `cr @work ...`.
+  if [[ -n "$forced" ]]; then
+    cr_ensure_home
+    cr_account_exists "$forced" || cr_die "unknown account: $forced (try: cr list)"
+    local inferred; inferred="$(cr_account_provider "$forced")"
+    if (( provider_explicit )) && [[ "$CR_PROVIDER" != "$inferred" ]]; then
+      cr_die "account '$forced' belongs to provider '$inferred', not '$CR_PROVIDER'"
+    fi
+    CR_PROVIDER="$inferred"
     [[ "${1:-}" == "--" ]] && shift
-    cr_launch "$forced" "$@"; return
   fi
+
+  # Management commands do not consume provider CLI flags. Launches consume
+  # --watch for both providers, and consume --sandbox/-s only for Claude. Thus
+  # Codex receives its native -s/--sandbox argv unchanged.
+  local launch_context=0
+  if [[ -n "$forced" ]]; then launch_context=1
+  else
+    case "${1:-}" in
+      add|add-backend|add-api|rotate|register-default|relink|login|logout|remove|rm|list|accounts|ls|use|unuse|policy|config|usage|adopt|status|menubar|doctor|help|--help|-h) ;;
+      *) launch_context=1 ;;
+    esac
+  fi
+  CR_SANDBOX=0; CR_WATCH=0
+  if (( launch_context )); then
+    _rest=(); _seen_sep=0
+    while (($#)); do
+      if [[ "$_seen_sep" == 0 && ( "$1" == "--watch" || "$1" == "-w" ) ]]; then
+        CR_WATCH=1; shift; continue
+      fi
+      if [[ "$_seen_sep" == 0 && "$CR_PROVIDER" == "claude" && ( "$1" == "--sandbox" || "$1" == "-s" ) ]]; then
+        CR_SANDBOX=1; shift; continue
+      fi
+      [[ "$1" == "--" ]] && _seen_sep=1
+      _rest+=("$1"); shift
+    done
+    set -- ${_rest[@]+"${_rest[@]}"}
+  fi
+  # With a forced account, `--` terminates router flags and is not forwarded.
+  [[ -n "$forced" && "${1:-}" == "--" ]] && shift
+  if [[ "$CR_PROVIDER" == "claude" && "$CR_SANDBOX" == 1 ]] && ! command -v cco >/dev/null 2>&1; then
+    cr_die "--sandbox needs 'cco' (not found). Install it or drop --sandbox"
+  fi
+
+  if [[ -n "$forced" ]]; then cr_launch "$forced" "$@"; return; fi
 
   case "${1:-}" in
     add)              shift; cr_cmd_add "$@" ;;
@@ -1210,10 +1399,10 @@ main() {
                       if [[ "$(cr_config_read | jq '.accounts|length')" -eq 0 ]]; then
                         cr_cmd_help; return
                       fi
-                      local def; def="$(cr_config_read | jq -r '.defaultAccount // empty')"
+                      local def; def="$(cr_provider_pinned "$CR_PROVIDER")"
                       cr_launch "$def" ;;
     *)                # anything else → claude args; route by policy/pin
-                      local def; def="$(cr_config_read | jq -r '.defaultAccount // empty')"
+                      local def; def="$(cr_provider_pinned "$CR_PROVIDER")"
                       cr_launch "$def" "$@" ;;
   esac
 }

@@ -131,7 +131,7 @@ cr_fetch_codex_usage_raw() {
     else .rateLimits end' 2>/dev/null)" || return 1
   [[ -n "$snapshot" && "$snapshot" != "null" ]] || return 1
   printf '%s' "$snapshot" | jq -e '
-    def label($w; $fallback):
+    def window_label($w; $fallback):
       if ($w.windowDurationMins // null) == 300 then "5h session"
       elif ($w.windowDurationMins // null) == 10080 then "7d total"
       elif ($w.windowDurationMins // null) != null then "\($w.windowDurationMins)m window"
@@ -140,7 +140,7 @@ cr_fetch_codex_usage_raw() {
       if $w == null then null else {
         utilization: $w.usedPercent,
         resets_at: (if $w.resetsAt == null then null else ($w.resetsAt | todate) end),
-        label: label($w; $fallback)
+        label: window_label($w; $fallback)
       } end;
     {five_hour: window(.primary; "primary"), seven_day: window(.secondary; "secondary")}
     | select((.five_hour != null) or (.seven_day != null))' 2>/dev/null
@@ -240,6 +240,7 @@ cr_render_account_meters() {
 # If a specific api account is named explicitly, print a short note and return 0.
 cr_render_meters() {
   local name="${1:-}"
+  local rc=0
   cr_say "usage left per window  (█ = available)"
   if [[ -n "$name" ]]; then
     local kind; kind="$(cr_account_kind "$name" 2>/dev/null || true)"
@@ -248,7 +249,7 @@ cr_render_meters() {
       printf '\n' >&2
       return 0
     fi
-    cr_render_account_meters "$name"
+    cr_render_account_meters "$name" || rc=$?
   else
     local a any=0
     while IFS= read -r a; do
@@ -257,6 +258,7 @@ cr_render_meters() {
     [[ "$any" -eq 0 ]] && cr_warn "no usage data available"
   fi
   printf '\n' >&2
+  return "$rc"
 }
 
 # Cache usagePct + a compact per-window snapshot + a timestamp into the registry,

@@ -60,6 +60,35 @@ printf '\n' >> "$FAKE_CODEX_LOG"
   done
 } > "$out"
 
+# Minimal, fully local Codex app-server JSONL handshake. The response shape is
+# configurable enough to cover identity lookup, rate-limit normalization, and
+# graceful fallback without a network, credential file, or real Codex process.
+if [[ "${1:-}" == "app-server" ]]; then
+  [[ "${FAKE_CODEX_APP_SERVER_MODE:-ok}" == "fail" ]] && exit 1
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "${FAKE_CODEX_RPC_LOG:?FAKE_CODEX_RPC_LOG must be set}"
+    method="$(jq -r '.method // empty' <<<"$line" 2>/dev/null)"
+    case "$method" in
+      initialize)
+        printf '%s\n' '{"id":0,"result":{"serverInfo":{"name":"fake-codex"}}}'
+        ;;
+      account/read)
+        printf '%s\n' '{"id":1,"result":{"account":{"type":"chatgpt","email":"codex@example.test","planType":"plus"}}}'
+        ;;
+      account/rateLimits/read)
+        printf '%s\n' '{"id":1,"result":{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":2000000000},"secondary":{"usedPercent":60,"windowDurationMins":10080,"resetsAt":2000600000}}}}'
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+if [[ "${1:-}" == "login" && "${2:-}" == "--with-api-key" ]]; then
+  IFS= read -r api_key || true
+  printf '<%s>\n' "$api_key" >> "${FAKE_CODEX_STDIN_LOG:?FAKE_CODEX_STDIN_LOG must be set}"
+  exit "${FAKE_CODEX_EXIT:-0}"
+fi
+
 # Keep auth commands hermetic while behaving enough like Codex for cr's
 # management flows. `login status` is successful by default; tests can force a
 # failure with FAKE_CODEX_LOGIN_STATUS_EXIT.
@@ -72,7 +101,11 @@ EOF
 chmod +x "$FAKEBIN/codex"
 export FAKE_CODEX_OUT="$SBX/codex_out"
 export FAKE_CODEX_LOG="$SBX/codex_calls.log"
+export FAKE_CODEX_RPC_LOG="$SBX/codex_rpc.log"
+export FAKE_CODEX_STDIN_LOG="$SBX/codex_stdin.log"
 : > "$FAKE_CODEX_LOG"
+: > "$FAKE_CODEX_RPC_LOG"
+: > "$FAKE_CODEX_STDIN_LOG"
 
 CR="$CR_REPO/cr"
 run_cr() { "$CR" "$@" 2>"$SBX/stderr"; }
@@ -295,7 +328,7 @@ codex_out="$(cat "$FAKE_CODEX_OUT")"
 eq "Codex --sandbox is passed through" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<--sandbox>"
 eq "Codex --sandbox value is passed through" "$(grep '^ARG1=' <<<"$codex_out")" "ARG1=<read-only>"
 
-run_cr --provider codex --watch --account codex-one -- exec hi
+run_cr --provider codex --account codex-one --watch -- exec hi
 codex_out="$(cat "$FAKE_CODEX_OUT")"
 eq "Codex watch bypass still launches Codex" "$(grep '^ARG0=' <<<"$codex_out")" "ARG0=<exec>"
 if grep -qiE 'watch.*(without|unsupported|not supported|bypass)' "$SBX/stderr"; then
@@ -386,6 +419,55 @@ if grep -q $'^CALL\t<logout>$' "$FAKE_CODEX_LOG"; then ok "Codex logout uses nat
 "$CR" --provider codex doctor codex-new >/dev/null 2>&1
 if grep -q $'^CALL\t<login>\t<status>$' "$FAKE_CODEX_LOG"; then ok "Codex doctor uses 'codex login status'"; else bad "Codex doctor uses 'codex login status'" "$(cat "$FAKE_CODEX_LOG")"; fi
 
+: > "$FAKE_CODEX_LOG"; : > "$FAKE_CODEX_STDIN_LOG"
+OPENAI_API_KEY="sk-hermetic-openai" \
+  "$CR" --provider codex add-api codex-api --from-env >/dev/null 2>"$SBX/codex_add_api_err"; rc=$?
+eq "Codex add-api exits 0 with fake stdin auth" "$rc" "0"
+if grep -q $'^CALL\t<login>\t<--with-api-key>$' "$FAKE_CODEX_LOG"; then
+  ok "Codex add-api uses native login --with-api-key"
+else
+  bad "Codex add-api uses native login --with-api-key" "$(cat "$FAKE_CODEX_LOG")"
+fi
+eq "Codex add-api sends the environment key over stdin" \
+   "$(cat "$FAKE_CODEX_STDIN_LOG")" "<sk-hermetic-openai>"
+eq "Codex add-api persists provider=codex" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api")|.provider' "$CR_HOME/config.json")" "codex"
+eq "Codex add-api persists kind=api" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api")|.kind' "$CR_HOME/config.json")" "api"
+eq "Codex add-api is explicit-only by default" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api")|.rotate' "$CR_HOME/config.json")" "false"
+eq "Codex add-api never persists the secret" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api")|has("apiKey")' "$CR_HOME/config.json")" "false"
+codex_api_home="$(jq -r '.accounts[]|select(.name=="codex-api")|.configDir' "$CR_HOME/config.json")"
+if grep -q '^cli_auth_credentials_store[[:space:]]*=[[:space:]]*"file"' "$codex_api_home/config.toml" 2>/dev/null; then
+  ok "Codex add-api configures file credential storage"
+else
+  bad "Codex add-api configures file credential storage" "$(cat "$codex_api_home/config.toml" 2>/dev/null || echo missing)"
+fi
+
+: > "$FAKE_CODEX_STDIN_LOG"
+CODEX_API_KEY="sk-hermetic-codex" \
+  "$CR" --provider codex add-api codex-api-rotate --from-env --rotate >/dev/null 2>&1
+eq "Codex add-api --rotate opts the API account into its provider pool" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api-rotate")|.rotate' "$CR_HOME/config.json")" "true"
+eq "Codex add-api accepts CODEX_API_KEY through stdin" \
+   "$(cat "$FAKE_CODEX_STDIN_LOG")" "<sk-hermetic-codex>"
+eq "Rotating Codex API account still stores no secret" \
+   "$(jq -r '.accounts[]|select(.name=="codex-api-rotate")|has("apiKey")' "$CR_HOME/config.json")" "false"
+
+: > "$FAKE_CODEX_LOG"; : > "$FAKE_CODEX_RPC_LOG"
+"$CR" --provider codex register-default codex-global >/dev/null 2>&1; rc=$?
+eq "Codex register-default exits 0" "$rc" "0"
+eq "Codex register-default persists provider" \
+   "$(jq -r '.accounts[]|select(.name=="codex-global")|.provider' "$CR_HOME/config.json")" "codex"
+eq "Codex register-default keeps the native default home" \
+   "$(jq -r '.accounts[]|select(.name=="codex-global")|.configDir' "$CR_HOME/config.json")" "null"
+if grep -q '"method":"account/read"' "$FAKE_CODEX_RPC_LOG"; then
+  ok "Codex register-default reads identity through app-server"
+else
+  bad "Codex register-default reads identity through app-server" "$(cat "$FAKE_CODEX_RPC_LOG")"
+fi
+
 echo "== providers: Codex does not use Claude usage or adopt paths =="
 seed_providers
 NO_CLAUDE_BIN="$SBX/no_claude_provider_bin"; mkdir -p "$NO_CLAUDE_BIN"
@@ -402,9 +484,38 @@ printf 'security %s\n' "$*" >> "$NO_CLAUDE_CALLS"
 exit 97
 EOF
 chmod +x "$NO_CLAUDE_BIN/curl" "$NO_CLAUDE_BIN/security"
+: > "$FAKE_CODEX_RPC_LOG"
 PATH="$NO_CLAUDE_BIN:$PATH" "$CR" --provider codex usage codex-one >"$SBX/codex_usage_out" 2>"$SBX/codex_usage_err"; rc=$?
-if [[ "$rc" -eq 0 ]]; then ok "Codex usage capability degrades gracefully"; else bad "Codex usage capability degrades gracefully" "rc=$rc $(cat "$SBX/codex_usage_err")"; fi
+if [[ "$rc" -eq 0 ]]; then ok "Codex app-server usage exits 0"; else bad "Codex app-server usage exits 0" "rc=$rc $(cat "$SBX/codex_usage_err")"; fi
+eq "Codex app-server usage normalizes the most constrained window" \
+   "$(jq -r '.accounts[]|select(.name=="codex-one")|.usagePct' "$CR_HOME/config.json")" "60"
+eq "Codex app-server primary window becomes 5h" \
+   "$(jq -r '.accounts[]|select(.name=="codex-one")|.usage.windows[0]|"\(.label):\(.used)"' "$CR_HOME/config.json")" "5h session:25"
+eq "Codex app-server secondary window becomes 7d" \
+   "$(jq -r '.accounts[]|select(.name=="codex-one")|.usage.windows[1]|"\(.label):\(.used)"' "$CR_HOME/config.json")" "7d total:60"
+if grep -q '"method":"initialize"' "$FAKE_CODEX_RPC_LOG" && \
+   grep -q '"method":"account/rateLimits/read"' "$FAKE_CODEX_RPC_LOG"; then
+  ok "Codex usage performs app-server initialize + rate-limit exchange"
+else
+  bad "Codex usage performs app-server initialize + rate-limit exchange" "$(cat "$FAKE_CODEX_RPC_LOG")"
+fi
 eq "Codex usage never calls Claude curl/keychain paths" "$(cat "$NO_CLAUDE_CALLS")" ""
+
+# An unavailable/older app-server is a capability fallback, never a reason to
+# leak into Anthropic usage polling or fail the CLI.
+seed_providers
+: > "$NO_CLAUDE_CALLS"
+FAKE_CODEX_APP_SERVER_MODE=fail PATH="$NO_CLAUDE_BIN:$PATH" \
+  "$CR" --provider codex usage codex-one >"$SBX/codex_usage_fallback_out" 2>"$SBX/codex_usage_fallback_err"; rc=$?
+if [[ "$rc" -eq 0 ]]; then ok "Codex usage unavailable fallback exits 0"; else bad "Codex usage unavailable fallback exits 0" "rc=$rc"; fi
+eq "Codex usage fallback does not fabricate cached usage" \
+   "$(jq -r '.accounts[]|select(.name=="codex-one")|.usagePct // "unset"' "$CR_HOME/config.json")" "unset"
+if grep -qiE 'unavailable|no usage data|usage poll failed' "$SBX/codex_usage_fallback_err"; then
+  ok "Codex usage unavailable fallback is explained"
+else
+  bad "Codex usage unavailable fallback is explained" "$(cat "$SBX/codex_usage_fallback_err")"
+fi
+eq "Codex usage fallback still avoids Claude curl/keychain" "$(cat "$NO_CLAUDE_CALLS")" ""
 
 "$CR" --provider codex adopt "$SID_CODEX" codex-two >"$SBX/codex_adopt_out" 2>"$SBX/codex_adopt_err"; rc=$?
 if [[ "$rc" -ne 0 ]]; then ok "Codex adopt is capability-gated"; else bad "Codex adopt is capability-gated" "unexpected success"; fi

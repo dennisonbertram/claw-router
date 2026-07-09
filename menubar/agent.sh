@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # agent.sh — LaunchAgent manager for provider-scoped Claw Router usage polling.
 #
-# The SwiftBar plugin reads only the cached snapshot and NEVER polls itself,
-# so it never triggers macOS Keychain prompts. This agent is the sole poller:
-# it runs `cr status --refresh` on a schedule, updating the cache silently.
-# Because launchd owns the process, macOS prompts ("Allow" / "Always Allow")
-# are shown once per account at agent launch — click **Always Allow** and they
-# never appear again.
+# The SwiftBar plugin reads only the cached snapshot and NEVER polls itself.
+# This agent is the sole poller: it refreshes the configured provider on a
+# schedule. Claude refresh may need one-time macOS Keychain authorization;
+# Codex refresh delegates to Codex's official interface and Claw Router never
+# reads Codex credentials.
 #
 # Usage:
 #   bash menubar/agent.sh install [interval_seconds]
